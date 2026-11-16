@@ -6,7 +6,7 @@ Usage:
 Writes index.html next to this file. Commit and push this folder to update the live site.
 
 why: the artifact asks Claude through the claude.ai viewer, which a plain website lacks,
-so shim.js stands in for it and answers through a free, keyless AI service.
+so shim.js stands in for it and answers through Apex's own model (model_server.py).
 """
 
 import pathlib
@@ -22,11 +22,11 @@ TAGLINE = (
     "first, teaches it properly, and ends with the best videos in English and Arabic."
 )
 
-# why: on this site the answers come from the free AI service, not Claude, so the page must not say Claude.
+# why: on this site the answers come from Apex's own model, not Claude, so the page must not say Claude.
 REWORD = {
-    "Only the pages an answer needs are sent to Claude.": "Only the pages an answer needs are sent to the AI that answers.",
+    "Only the pages an answer needs are sent to Claude.": "Only the pages an answer needs are sent to Apex's model.",
     "Pictures can't be sent to Claude from this view.": "Pictures can't be sent from this site.",
-    "Answers use your Claude account.": "Answers come from a free AI service.",
+    "Answers use your Claude account.": "Answers come from Apex's own model.",
 }
 
 HEAD = """<!doctype html>
