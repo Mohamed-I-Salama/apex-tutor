@@ -19,6 +19,9 @@
   var ENDPOINT = "https://text.pollinations.ai/openai";
   var MODEL = "openai";
   var MAX_WAIT_S = 60;
+  // why: the service silently holds a streamed request until 45 s after the previous one began, which looked like a stuck "Thinking", so the page counts that gap down itself.
+  var GAP_MS = 46000;
+  var lastStart = 0;
 
   function failure(code, message, text) {
     var error = { code: code, message: message || code };
@@ -160,6 +163,9 @@
     var waited = 0;
     for (;;) {
       if (stopped(opts.signal)) throw failure("cancelled", "Stopped");
+      var gap = Math.ceil((lastStart + GAP_MS - Date.now()) / 1000);
+      if (gap > 0) await waitWithNotice(gap, opts.signal);
+      lastStart = Date.now();
       var out = await once(messages, opts);
       if (!out.wait) return out;
       if (waited + out.wait > MAX_WAIT_S) throw failure("rate_limited", "Free limit reached.");
