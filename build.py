@@ -26,6 +26,7 @@ TAGLINE = (
 REWORD = {
     "Only the pages an answer needs are sent to Claude.": "Only the pages an answer needs are sent to the AI that answers.",
     "Pictures can't be sent to Claude from this view.": "Pictures can't be sent from this site.",
+    "Answers use your Claude account.": "Answers come from a free AI service.",
 }
 
 HEAD = """<!doctype html>
