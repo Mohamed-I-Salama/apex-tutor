@@ -13,16 +13,24 @@
 // why: the artifact asks Claude through the claude.ai viewer, which a plain website does not
 // have. This stands in for the viewer's `sample`, so the same page answers through Apex's own
 // model, Qwen3.6-35B-A3B, which model_server.py serves from Modal CPUs.
+//
+// Beyond the viewer's API it offers what a slow model that keeps what it has read needs:
+// limits().prefixCache, sample.warm() to read ahead, sample.keepAlive(), and opts.onProgress.
 (function () {
   if (window.claude) return;
 
-  var ENDPOINT = "https://msalama42003--apex-model-model-serve.us-east.modal.run/v1/chat/completions";
-  var SLOW_MS = 8000;
+  var BASE = "https://msalama42003--apex-model-model-serve.us-east.modal.run";
+  var ENDPOINT = BASE + "/v1/chat/completions";
   var RETRY_MS = 5000;
   var MAX_START_MS = 240000;
-  // why: Qwen's recommended settings for answering without a thinking phase, which would add a long silence on CPUs.
+  var RESUMES = 2;
+  // why: an awake server answers within a second; no answer by then means its machine is starting,
+  // which takes about a minute after 5 idle minutes.
+  var WAKE_MS = 3000;
+  // why: Qwen's recommended settings for answering without a thinking phase, which would add a long
+  // silence on CPUs. 8,000 tokens fits a 30-question quiz.
   var SETTINGS = {
-    max_tokens: 1500,
+    max_tokens: 8000,
     temperature: 0.7,
     top_p: 0.8,
     top_k: 20,
@@ -41,29 +49,7 @@
     return Boolean(signal && signal.aborted);
   }
 
-  function showNotice(text) {
-    var bar = document.createElement("div");
-    bar.setAttribute("role", "status");
-    bar.style.cssText = [
-      "position:fixed",
-      "top:calc(12px + env(safe-area-inset-top, 0px))",
-      "left:50%",
-      "transform:translateX(-50%)",
-      "z-index:2147483647",
-      "width:max-content",
-      "max-width:calc(100% - 32px)",
-      "padding:10px 14px",
-      "border-radius:10px",
-      "background:#1d2430",
-      "color:#fff",
-      "font:600 14px/1.4 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif",
-      "box-shadow:0 6px 20px rgba(0,0,0,.3)",
-      "text-align:center",
-    ].join(";");
-    bar.textContent = text;
-    document.body.appendChild(bar);
-    return bar;
-  }
+  function noop() {}
 
   function pause(ms, signal) {
     return new Promise(function (resolve, reject) {
@@ -83,23 +69,64 @@
     });
   }
 
-  async function once(messages, opts, onFirstText) {
+  // The page sends its instructions as the first turn; a chat model follows them best as the system message.
+  function toMessages(input) {
+    var turns = typeof input === "string" ? [{ role: "user", content: input }] : Array.prototype.slice.call(input);
+    return turns.map(function (turn, i) {
+      return { role: i === 0 && turns.length > 1 ? "system" : turn.role, content: String(turn.content) };
+    });
+  }
+
+  // why: the server reads JPEG and PNG, not WebP; and a phone photo is far bigger than the model uses.
+  function toJpeg(blob) {
+    return createImageBitmap(blob).then(function (bmp) {
+      var scale = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
+      var canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(bmp.width * scale));
+      canvas.height = Math.max(1, Math.round(bmp.height * scale));
+      var ctx = canvas.getContext("2d");
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+      if (bmp.close) bmp.close();
+      return canvas.toDataURL("image/jpeg", 0.85);
+    });
+  }
+
+  // One request. Streams text after `prefix`, reports progress, and says whether the answer finished,
+  // was cut off, or the model's machine isn't ready yet.
+  async function once(body, opts, report, prefix) {
+    var waking = setTimeout(function () {
+      report({ phase: "waking" });
+    }, WAKE_MS);
     var res;
     try {
       res = await fetch(ENDPOINT, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(Object.assign({ model: "apex", stream: true, messages: messages }, SETTINGS)),
+        body: JSON.stringify(body),
         signal: opts.signal,
       });
     } catch (err) {
-      if (stopped(opts.signal)) throw failure("cancelled", "Stopped");
+      clearTimeout(waking);
+      if (stopped(opts.signal)) throw failure("cancelled", "Stopped", prefix);
       return { retry: true };
     }
+    clearTimeout(waking);
     // why: these come from Modal while the model's machine is still starting after a quiet spell.
     if (res.status === 502 || res.status === 503 || res.status === 504) return { retry: true };
-    if (res.status === 429) throw failure("rate_limited", "Apex's model is busy.");
-    if (!res.ok || !res.body) throw failure("upstream_error", "Apex's model answered " + res.status + ".");
+    if (res.status === 429) throw failure("rate_limited", "Apex's model is busy.", prefix);
+    if (res.status === 400) {
+      var said = "";
+      try {
+        said = await res.text();
+      } catch (err) {
+        said = "";
+      }
+      if (/context|exceed|too long|n_ctx/i.test(said)) throw failure("prompt_too_large", "Too much text for one question.", prefix);
+      throw failure("invalid_request", "Apex's model couldn't read this request.", prefix);
+    }
+    if (!res.ok || !res.body) throw failure("upstream_error", "Apex's model answered " + res.status + ".", prefix);
     var reader = res.body.getReader();
     var decoder = new TextDecoder();
     var pending = "";
@@ -123,62 +150,94 @@
           } catch (err) {
             continue;
           }
+          if (event.prompt_progress) {
+            var p = event.prompt_progress;
+            report({ phase: "reading", total: p.total, cache: p.cache, processed: p.processed });
+          }
           var choice = event.choices && event.choices[0];
           if (!choice) continue;
           if (choice.finish_reason) reason = choice.finish_reason;
           var delta = choice.delta && choice.delta.content;
           if (typeof delta === "string" && delta) {
-            if (!text) onFirstText();
             text += delta;
-            if (opts.onText) opts.onText({ text: text, delta: delta });
+            if (opts.onText) opts.onText({ text: prefix + text, delta: delta });
           }
         }
       }
     } catch (err) {
-      throw stopped(opts.signal)
-        ? failure("cancelled", "Stopped", text)
-        : failure("upstream_error", "The connection dropped.", text);
+      if (stopped(opts.signal)) throw failure("cancelled", "Stopped", prefix + text);
+      return { cut: true, text: text };
     }
-    if (!text.trim()) throw failure("empty_completion", "No answer came back.");
-    return { text: text, truncated: reason === "length" };
+    // why: when Modal moves the machine mid-answer, the stream just ends, with no finish reason.
+    if (!reason) return { cut: true, text: text };
+    return { text: text, reason: reason };
+  }
+
+  // Keep asking until the model's machine is up; carry on from the cut when an answer is cut off.
+  async function run(messages, opts, extra) {
+    var report = opts.onProgress || noop;
+    var base = Object.assign({ model: "apex", stream: true, return_progress: true, messages: messages }, SETTINGS, extra);
+    var began = Date.now();
+    var done = "";
+    var resumes = 0;
+    for (;;) {
+      if (stopped(opts.signal)) throw failure("cancelled", "Stopped", done);
+      // why: the server continues a final assistant message instead of starting a new answer.
+      var body = done ? Object.assign({}, base, { messages: messages.concat([{ role: "assistant", content: done }]) }) : base;
+      var out = await once(body, opts, report, done);
+      if (out.retry) {
+        if (Date.now() - began > MAX_START_MS) throw failure("upstream_error", "Apex's model didn't start in time.", done);
+        await pause(RETRY_MS, opts.signal);
+        continue;
+      }
+      done += out.text;
+      if (out.cut) {
+        if (resumes >= RESUMES) throw failure("upstream_error", "The connection dropped.", done);
+        resumes += 1;
+        began = Date.now();
+        report({ phase: "resuming" });
+        continue;
+      }
+      return { text: done, reason: out.reason };
+    }
   }
 
   async function sample(input, opts) {
     opts = opts || {};
-    var turns =
-      typeof input === "string" ? [{ role: "user", content: input }] : Array.prototype.slice.call(input);
-    // why: the page sends its instructions as the first turn; a chat model follows them best as the system message.
-    var messages = turns.map(function (turn, i) {
-      return { role: i === 0 && turns.length > 1 ? "system" : turn.role, content: String(turn.content) };
-    });
-    var bar = null;
-    var slow = setTimeout(function () {
-      bar = showNotice("Apex runs on its own model, so a first answer can take up to a minute to start.");
-    }, SLOW_MS);
-    var settle = function () {
-      clearTimeout(slow);
-      if (bar) bar.remove();
-      bar = null;
-    };
-    var began = Date.now();
-    try {
-      for (;;) {
-        if (stopped(opts.signal)) throw failure("cancelled", "Stopped");
-        var out = await once(messages, opts, settle);
-        if (!out.retry) return out;
-        if (Date.now() - began > MAX_START_MS) {
-          throw failure("upstream_error", "Apex's model didn't start in time.");
-        }
-        await pause(RETRY_MS, opts.signal);
-      }
-    } finally {
-      settle();
+    var messages = toMessages(input);
+    if (opts.images && opts.images.length) {
+      var urls = await Promise.all(Array.prototype.map.call(opts.images, toJpeg));
+      var last = messages[messages.length - 1];
+      last.content = urls
+        .map(function (url) {
+          return { type: "image_url", image_url: { url: url } };
+        })
+        .concat([{ type: "text", text: last.content }]);
     }
+    var out = await run(messages, opts, {});
+    if (!out.text.trim()) throw failure("empty_completion", "No answer came back.");
+    return { text: out.text, truncated: out.reason === "length" };
   }
 
+  // Have the model read these turns now, so the question that follows only reads what is new.
+  sample.warm = async function (input, opts) {
+    opts = opts || {};
+    await run(toMessages(input), opts, { max_tokens: 1 });
+  };
+
+  // A light request that stops the model's machine going to sleep while someone is using the page.
+  sample.keepAlive = function () {
+    return fetch(BASE + "/health").then(noop, noop);
+  };
+
   sample.limits = function () {
-    // why: the model reads about 120 tokens a second on CPUs, so a smaller prompt keeps the wait for an answer short.
-    return Promise.resolve({ maxPromptBytes: 24000, modelTiers: ["default"] });
+    return Promise.resolve({
+      // why: about 27,000 tokens, which leaves room for a long quiz in the model's 64k context.
+      maxPromptBytes: 110000,
+      modelTiers: ["default"],
+      images: { maxCount: 2, maxInputBytes: 20 * 1024 * 1024 },
+      prefixCache: true,
+    });
   };
 
   window.claude = {
@@ -407,6 +466,11 @@ button:disabled{cursor:default}
 .verdict.bad{color:var(--bad)}
 .widget-foot{padding:12px 16px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;border-top:1px solid var(--line);background:var(--surface-2)}
 .widget-foot .score{margin:0;font-weight:700}
+.widget-more{margin:0;padding:12px 16px;border-top:1px solid var(--line);color:var(--ink-2);font-size:.88rem}
+.widget-more::before{content:"";display:inline-block;width:7px;height:7px;margin-right:9px;border-radius:50%;background:var(--accent);vertical-align:middle;animation:widget-pulse 1.2s ease-in-out infinite}
+@keyframes widget-pulse{50%{opacity:.25}}
+@media (prefers-reduced-motion:reduce){.widget-more::before{animation:none}}
+.widget-note{margin:0;padding:10px 16px;border-top:1px solid var(--line);color:var(--ink-2);font-size:.86rem}
 .foot-btns{display:flex;flex-wrap:wrap;gap:8px}
 .card-stage{padding:16px;perspective:1200px}
 .flip{display:block;width:100%;border:0;background:none;padding:0;color:inherit;text-align:center}
@@ -430,6 +494,7 @@ button:disabled{cursor:default}
 .action{flex:none;height:32px;padding:0 13px;border-radius:999px;border:1px solid var(--line);background:var(--surface);color:var(--ink);font-size:.88rem;white-space:nowrap}
 .action:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
 .action:disabled{opacity:.45}
+.quiz-pick{display:contents}
 .composer{background:var(--surface);border:1px solid var(--line-strong);border-radius:22px;box-shadow:var(--shadow);padding:10px 10px 8px 14px;display:flex;flex-direction:column;gap:6px}
 .composer:focus-within{border-color:var(--accent)}
 .attachments{display:flex;flex-wrap:wrap;gap:8px;padding-top:2px}
@@ -614,7 +679,7 @@ button:disabled{cursor:default}
               <h2>Study from your own PDFs</h2>
               <p>Add lecture notes, a textbook chapter or a paper. Apex reads it, then summarises it, quizzes you, makes flashcards and explains the figures, pointing to the page each answer came from.</p>
               <ul class="can"><li>Summaries</li><li>Quizzes</li><li>Flashcards</li><li>Figures explained</li><li>Page references</li></ul>
-              <p class="fine">Your PDFs stay on this device. Only the pages an answer needs are sent to Apex's model.</p>
+              <p class="fine">Your PDFs stay on this device. Their text is sent to Apex's own model, which answers from it.</p>
             </div>
             <button type="button" class="btn-primary" id="adPick">Choose a PDF</button>
           </div>
@@ -688,6 +753,10 @@ button:disabled{cursor:default}
   const PDFJS_WORKER = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
   const FENCE = "```";
   const FULL_LIMIT = 150000;   // characters of PDF text sent whole for whole-document requests
+  // why: a model that keeps what it has read (Apex's own model) reads each PDF once, up front, at about
+  // 500 characters a second on CPUs. This much is about 80 seconds of reading.
+  const KEPT_DOC_LIMIT = 40000;
+  const QUIZ_COUNTS = [10, 20, 30];
   const MAX_DOCS = 6;
 
   // ---------- curriculum map (built by tools/build_graph.py; injected at publish time) ----------
@@ -819,7 +888,7 @@ button:disabled{cursor:default}
   }
   function saveStyle() { try { localStorage.setItem(STYLE_KEY, JSON.stringify(state.style)); } catch (e) { /* storage blocked */ } }
 
-  const state = { turns: [], docs: [], pending: [], busy: false, ctl: null, epoch: 0, style: loadStyle(), sample: null, limits: null, chatOff: null, docSeq: 0 };
+  const state = { turns: [], docs: [], pending: [], busy: false, ctl: null, epoch: 0, style: loadStyle(), sample: null, limits: null, chatOff: null, docSeq: 0, histStart: 0, kept: null };
   const coarse = window.matchMedia && matchMedia("(pointer: coarse)").matches;
 
   // ---------- Claude ----------
@@ -831,11 +900,121 @@ button:disabled{cursor:default}
     state.sample = s;
     try { state.limits = await s.limits(); } catch (e) { state.limits = null; }
     if (!viewerEl.hidden && viewer.doc) renderViewerChrome();
+    if (keeps()) startKeeping();
   });
   const canImages = () => !!(state.limits && state.limits.images);
   const maxImages = () => (state.limits && state.limits.images && state.limits.images.maxCount) || 0;
   const canTools = () => !!(state.limits && state.limits.tools);
   const tierOK = t => !(state.limits && Array.isArray(state.limits.modelTiers)) || state.limits.modelTiers.includes(t);
+
+  // ---------- a model that keeps what it has read (Apex's own model) ----------
+  // why: on CPUs, reading is the slow part of an answer (about 120 tokens a second). A model that keeps
+  // what it has read only reads what is new, so the page sends each conversation as one prompt that
+  // only grows at the end, keeps the PDFs' text in it, and has the model read ahead while the
+  // student is still choosing what to ask.
+  const keeps = () => !!(state.limits && state.limits.prefixCache && state.sample && typeof state.sample.warm === "function");
+  const keep = { active: Date.now(), contact: 0, running: null, again: false, done: "", pct: null, waking: false, view: null };
+  const AWAKE_MS = 4.5 * 60000;
+  function startKeeping() {
+    const touch = () => { keep.active = Date.now(); if (Date.now() - keep.contact > AWAKE_MS) readAhead(); };
+    document.addEventListener("pointerdown", touch, { passive: true });
+    document.addEventListener("keydown", touch, { passive: true });
+    input.addEventListener("focus", touch);
+    // why: the model's machine sleeps after 5 idle minutes and forgets what it read; while someone is
+    // using the page (a quiz can take a while to answer), a light ping keeps it awake.
+    setInterval(() => {
+      if (document.visibilityState !== "visible" || Date.now() - keep.active > 15 * 60000) return;
+      if (Date.now() - keep.contact > 3.5 * 60000) { keep.contact = Date.now(); state.sample.keepAlive(); }
+    }, 30000);
+  }
+  function readAhead() {
+    if (!keeps() || state.chatOff) return Promise.resolve();
+    if (keep.running) { keep.again = true; return keep.running; }
+    if (state.busy) return Promise.resolve();
+    const turns = fitTurns("", "(ready)");
+    const key = turns.slice(0, -1).map(t => t.content).join("\u0000");
+    if (key === keep.done && Date.now() - keep.contact < AWAKE_MS) return Promise.resolve();
+    keep.again = false;
+    const show = p => {
+      keep.waking = p.phase === "waking";
+      if (p.phase === "reading" && p.total) keep.pct = clamp(((p.processed || 0) - (p.cache || 0)) / Math.max(1, p.total - (p.cache || 0)), 0, 1);
+      renderAttachments();
+      if (keep.view) keep.view.status(progressLabel(p, readingWhat()));
+    };
+    keep.pct = 0;
+    keep.running = state.sample.warm(turns, { onProgress: show }).then(
+      () => { keep.done = key; keep.contact = Date.now(); },
+      () => { /* the question itself will read what is missing */ },
+    ).then(() => {
+      keep.running = null; keep.pct = null; keep.waking = false;
+      renderAttachments();
+      if (keep.again) return readAhead();
+    });
+    renderAttachments();
+    return keep.running;
+  }
+  // What the model is reading ahead: a PDF's text, or only Apex's instructions.
+  const readingWhat = () => textDocs().length ? "Reading your PDF first" : "Getting ready";
+  function progressLabel(p, reading) {
+    if (p.phase === "waking") return "Starting Apex's model. The first answer after a quiet spell takes about a minute.";
+    if (p.phase === "resuming") return "The connection dropped. Carrying on from where it stopped.";
+    if (p.phase === "reading") {
+      const todo = (p.total || 0) - (p.cache || 0);
+      if (todo < 600) return "Thinking";
+      const pct = Math.min(99, Math.floor((100 * ((p.processed || 0) - (p.cache || 0))) / todo));
+      return `${reading || "Reading"} · ${Math.max(0, pct)}%`;
+    }
+    return "Thinking";
+  }
+  // The PDFs' text that the model reads once and keeps: all of it when it fits, otherwise the start of
+  // every page, so a quiz or summary can draw on the whole document. Reference lists are left out.
+  function keptDocs() {
+    const docs = textDocs();
+    const key = docs.map(d => d.id + ":" + d.chars).join(",") + "|" + multi();
+    if (state.kept && state.kept.key === key) return state.kept;
+    const kept = { key, text: "", pages: new Set() };
+    state.kept = kept;
+    if (!docs.length) return kept;
+    const REFS = /^(?:\d+\.?\s*)?(?:references|bibliography|literature cited|works cited)\s*$/i;
+    const bodies = docs.map(d => {
+      const pages = [];
+      for (const p of d.pages) {
+        const lines = p.text.split("\n");
+        const at = lines.findIndex(l => REFS.test(l.trim()));
+        if (at >= 0 && p.n > d.numPages * 0.6) { const t = lines.slice(0, at).join("\n").trim(); if (t) pages.push({ n: p.n, text: t, part: true }); break; }
+        if (p.text.trim()) pages.push({ n: p.n, text: p.text, part: false });
+      }
+      return { d, pages };
+    });
+    const lens = bodies.flatMap(b => b.pages.map(p => p.text.length));
+    let cap = Math.max(0, ...lens);
+    if (lens.reduce((s, x) => s + x, 0) > KEPT_DOC_LIMIT) {
+      let lo = 200, hi = cap;
+      while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (lens.reduce((s, x) => s + Math.min(x, mid), 0) <= KEPT_DOC_LIMIT) lo = mid; else hi = mid - 1; }
+      cap = lo;
+    }
+    const cut = s => {
+      if (s.length <= cap) return s;
+      const room = s.slice(0, cap);
+      const end = Math.max(room.lastIndexOf("\n"), room.lastIndexOf(". ") + 1);
+      return (end > cap * 0.6 ? room.slice(0, end) : room).trim() + " […]";
+    };
+    let shortened = false;
+    const blocks = bodies.map(({ d, pages }) => {
+      const out = pages.map(p => {
+        const t = cut(p.text);
+        if (t === p.text && !p.part) kept.pages.add(d.id + ":" + p.n); else shortened = true;
+        return `[${cite(d, p.n)}]\n${t}`;
+      });
+      return `<document code="${d.code}" name="${esc(d.name)}">\n${out.join("\n\n")}\n</document>`;
+    });
+    const note = shortened
+      ? "The user's PDFs, kept for this whole conversation. Pages ending in […] were too long to keep whole, and reference lists are left out; when a question needs more of a page, its passages come with the question."
+      : "The user's PDFs, kept whole for this whole conversation (reference lists are left out).";
+    kept.text = `\n\n<material note="${note}">\n${blocks.join("\n\n")}\n</material>`;
+    return kept;
+  }
+  function docsChanged() { state.kept = null; readAhead(); }
 
   // ---------- documents ----------
   const liveDocs = () => state.docs.filter(d => d.status === "ready" || d.status === "scanned");
@@ -1025,6 +1204,7 @@ button:disabled{cursor:default}
     try { const bm = await bookmarks(pdf); if (bm) doc.outline = bm; } catch (e) { /* keep detected contents */ }
     doc.status = doc.scanned ? "scanned" : "ready";
     rebuildIndex();
+    docsChanged();
     if (doc.scanned) toast(`${doc.name} looks scanned, so its text can't be read. Open a page and ask about it, and Apex will look at it as a picture.`);
   }
 
@@ -1034,6 +1214,7 @@ button:disabled{cursor:default}
     state.docs = state.docs.filter(d => d !== doc);
     state.pending = state.pending.filter(p => p.doc !== doc);
     rebuildIndex(); renderAttachments(); updatePdfActions(); updateSend();
+    docsChanged();
   }
 
   // ---------- search over the PDFs (BM25) ----------
@@ -1132,13 +1313,16 @@ button:disabled{cursor:default}
       name.type = "button"; name.disabled = !open; name.title = open ? `Open ${d.name}` : d.name;
       name.addEventListener("click", () => openViewer(d, 1));
       const meta = el("span", "chip-meta");
+      const modelReading = keep.running && d.status === "ready" && d.chars > 0;
       meta.textContent = d.status === "loading" ? (d.numPages ? `Reading ${d.done} of ${d.numPages}` : "Opening")
-        : d.status === "error" ? "Couldn't read" : d.status === "scanned" ? `${d.numPages} pages · scanned` : `${d.numPages} pages`;
+        : d.status === "error" ? "Couldn't read" : d.status === "scanned" ? `${d.numPages} pages · scanned`
+        : modelReading ? (keep.waking ? "Waking Apex" : `Apex is reading · ${Math.round((keep.pct || 0) * 100)}%`) : `${d.numPages} pages`;
       if (d.status === "error") chip.title = d.error || "";
       const x = el("button", "chip-x"); x.type = "button"; x.innerHTML = ICON.close; x.setAttribute("aria-label", `Remove ${d.name}`);
       x.addEventListener("click", () => removeDoc(d));
       chip.append(icon, name, meta, x);
       if (d.status === "loading") { const bar = el("span", "chip-progress"); bar.style.setProperty("--p", d.numPages ? String(d.done / d.numPages) : "0.04"); chip.append(bar); }
+      else if (modelReading) { const bar = el("span", "chip-progress"); bar.style.setProperty("--p", String(Math.max(0.04, keep.pct || 0))); chip.append(bar); }
       attachmentsEl.append(chip);
     }
     for (const p of state.pending) {
@@ -1176,14 +1360,34 @@ button:disabled{cursor:default}
       openViewer(d, d.figures.length ? d.figures[0].page : 1);
       return;
     }
+    if (act === "quiz") { chooseQuizCount(my); return; }
     const text = {
       summary: `Summarise ${my} for revision.`,
       keypoints: `Give me the high-yield points and exam tips from ${my}.`,
-      quiz: `Quiz me on ${my}: 5 exam-style questions.`,
       cards: `Make flashcards from ${my}.`,
     }[act];
     if (text) send(text, { whole: true });
   });
+  // why: students choose how long a quiz is, and every quiz ends with a button for more questions.
+  function chooseQuizCount(my) {
+    const shown = Array.from(pdfActions.children).filter(n => !n.hidden);
+    const pick = el("span", "quiz-pick");
+    const done = () => { pick.remove(); for (const n of shown) n.hidden = false; };
+    pick.append(el("span", "pdf-actions-label", "How many?"));
+    for (const n of QUIZ_COUNTS) {
+      const b = el("button", "action", String(n));
+      b.type = "button";
+      b.addEventListener("click", () => { done(); send(`Quiz me on ${my}: ${n} exam-style questions.`, { whole: true }); });
+      pick.append(b);
+    }
+    const cancel = el("button", "action", "Cancel");
+    cancel.type = "button";
+    cancel.addEventListener("click", done);
+    pick.append(cancel);
+    for (const n of shown) n.hidden = true;
+    pdfActions.append(pick);
+    pick.querySelector("button").focus();
+  }
 
   function handleFiles(list) {
     for (const f of Array.from(list || [])) {
@@ -1361,7 +1565,7 @@ WHAT YOU CAN MAKE (the user asks in plain words; never ask them to pick a format
 ${FENCE}quiz
 {"title": "Ferrule and post design", "questions": [{"q": "Question stem", "options": ["...", "...", "...", "..."], "answer": 2, "why": "Why the right answer is right, and why the most tempting wrong option is wrong.", "source": "p. 12"}]}
 ${FENCE}
-  "answer" is the 0-based index of the single best answer. Default to 5 questions unless asked for a different number. Write single-best-answer questions at postgraduate level: mostly short clinical scenarios or "most likely / best next step" stems that test understanding rather than trivia. Make every distractor plausible (a real misconception or a near-miss value), keep the options similar in length, never use "all of the above" or "none of the above", and vary where the correct answer sits. "source" is the page citation${m ? " (with the document code)" : ""} when the question comes from the user's PDF, otherwise "". Don't reveal the answers outside the JSON.
+  "answer" is the 0-based index of the single best answer. Default to 10 questions unless asked for a different number, and write at most 30 at a time. Write single-best-answer questions at postgraduate level: mostly short clinical scenarios or "most likely / best next step" stems that test understanding rather than trivia. Make every distractor plausible (a real misconception or a near-miss value), keep the options similar in length, never use "all of the above" or "none of the above", and vary where the correct answer sits. "source" is the page citation${m ? " (with the document code)" : ""} when the question comes from the user's PDF, otherwise "". Don't reveal the answers outside the JSON.
 - Flashcards: one short intro line, then exactly one fenced code block whose language tag is cards, containing JSON like this:
 ${FENCE}cards
 {"title": "Irrigants", "cards": [{"front": "Question or cue", "back": "Shortest complete answer", "source": "p. 4"}]}
@@ -1409,7 +1613,7 @@ FORMAT
     }
     return out.join("\n\n");
   }
-  const buildInstructions = () => rules() + "\n\n" + prefsBlock() + "\n\n" + libraryBlock();
+  const buildInstructions = () => rules() + "\n\n" + prefsBlock() + "\n\n" + libraryBlock() + (keeps() ? keptDocs().text : "");
 
   const WHOLE_RE = /\b(summar\w*|overview|key points?|high[- ]yield|main points|cheat ?sheet|revision notes|quiz|mcqs?|questions|flash ?cards?|test me|everything|whole|entire)\b/i;
   const DOC_RE = /\b(pdfs?|papers?|documents?|docs?|files?|lectures?|notes|slides|articles?|chapters?|this|it|them|uploads?)\b/i;
@@ -1462,7 +1666,8 @@ FORMAT
     const docs = liveDocs();
     if (!docs.length) return out;
     const tdocs = textDocs();
-    const parts = [], seen = new Set();
+    const kept = keeps() ? keptDocs() : null;
+    const parts = [], seen = new Set(kept ? kept.pages : []);
     const pagesText = (d, from, to, cap) => {
       const bits = [];
       let used = 0;
@@ -1485,23 +1690,33 @@ FORMAT
     };
     for (const a of attachments) {
       if (a.kind !== "page") continue;
-      const t = pagesText(a.doc, a.page, a.page, 30000);
+      const raw = (a.doc.pages[a.page - 1] && a.doc.pages[a.page - 1].text) || "";
+      const t = kept ? (raw ? `[${cite(a.doc, a.page)}]\n${raw}` : "") : pagesText(a.doc, a.page, a.page, 30000);
       if (t) parts.push(`<page_text note="the page the user is asking about">\n${t}\n</page_text>`);
       if (imgOK && a.blob && room()) { out.images.push(a.blob); out.notes.push(`a picture of ${pageName(a.doc, a.page)}`); }
       else if (!t) out.notes.push(`${pageName(a.doc, a.page)}, which has no readable text here`);
     }
     const refs = findRefs(text, docs);
-    let refBudget = 40000;
+    let refBudget = kept ? 12000 : 40000;
     for (const r of refs) {
       const t = pagesText(r.doc, r.from, r.to, refBudget);
       if (t) { parts.push(`<pages note="pages the user mentioned">\n${t}\n</pages>`); refBudget -= t.length; }
       const already = attachments.some(a => a.kind === "page" && a.doc === r.doc && a.page === r.from);
-      if (!already && (r.label || !t)) await wantImage(r.doc, r.from, r.label);
+      const unreadable = kept ? !((r.doc.pages[r.from - 1] || {}).text) : !t;
+      if (!already && (r.label || unreadable)) await wantImage(r.doc, r.from, r.label);
     }
     const total = tdocs.reduce((s, d) => s + d.chars, 0);
     const whole = intent.whole === true || (intent.whole !== false && WHOLE_RE.test(text) && DOC_RE.test(text));
     out.whole = whole;
-    if (tdocs.length) {
+    if (tdocs.length && kept) {
+      // The PDFs are already in the instructions; add only passages the model hasn't got whole.
+      const all = tdocs.every(d => d.pages.every(p => !p.text || kept.pages.has(d.id + ":" + p.n)));
+      if (!whole && !all) {
+        // why: every 1,000 characters here adds about 2 seconds before the answer starts.
+        const hits = search(queryFor(text), 4, 4000).filter(c => !seen.has(c.doc.id + ":" + c.page));
+        if (hits.length) parts.push(`<excerpts note="More of the user's PDFs that matches this message.">\n` + hits.map(c => `[${cite(c.doc, c.page)}]\n${c.text}`).join("\n---\n") + "\n</excerpts>");
+      }
+    } else if (tdocs.length) {
       if (whole && total <= FULL_LIMIT) {
         for (const d of tdocs) {
           const body = pagesText(d, 1, d.numPages, FULL_LIMIT);
@@ -1596,11 +1811,29 @@ FORMAT
   function fitTurns(block, tail) {
     const max = ((state.limits && state.limits.maxPromptBytes) || 262144) - 6000;
     const head = buildInstructions();
+    if (keeps()) return fitKept(head, block, tail, max);
     let hist = state.turns.slice(-24);
     const histBytes = () => hist.reduce((s, t) => s + byteLen(t.content), 0);
     const fixed = byteLen(head) + byteLen(tail) + 16;
     while (hist.length && fixed + byteLen(block) + histBytes() > max) hist = hist.slice(2);
     if (fixed + byteLen(block) + histBytes() > max) block = cutToBytes(block, Math.max(0, max - fixed - histBytes()));
+    return [{ role: "user", content: head }, ...hist, { role: "user", content: (block ? block + "\n\n" : "") + tail }];
+  }
+  // why: a keeping model reuses everything up to the first change, so earlier messages are sent exactly
+  // as they were, passages included, and the history only grows at the end. When it must shrink, a
+  // big piece goes at once, so the answers after that reuse the rest again.
+  function fitKept(head, block, tail, max) {
+    const sent = t => t.sent || t.content;
+    const size = from => state.turns.slice(from).reduce((s, t) => s + byteLen(sent(t)), 0);
+    const fixed = byteLen(head) + byteLen(tail) + 16;
+    let start = Math.min(state.histStart, state.turns.length);
+    if (fixed + byteLen(block) + size(start) > max || state.turns.length - start > 40) {
+      const room = Math.max(0, (max - fixed - byteLen(block)) / 2);
+      while (start < state.turns.length && (size(start) > room || state.turns.length - start > 20)) start += 2;
+      state.histStart = start;
+    }
+    if (fixed + byteLen(block) + size(start) > max) block = cutToBytes(block, Math.max(0, max - fixed - size(start)));
+    const hist = state.turns.slice(start).map(t => ({ role: t.role, content: sent(t) }));
     return [{ role: "user", content: head }, ...hist, { role: "user", content: (block ? block + "\n\n" : "") + tail }];
   }
 
@@ -1663,6 +1896,14 @@ FORMAT
         view.status("Finishing reading your PDF");
         await Promise.all(state.docs.map(d => d.promise).filter(Boolean));
       }
+      if (keep.running) {
+        // The model is already reading the instructions and PDFs this question needs; wait for it.
+        keep.view = view;
+        view.status(keep.waking ? progressLabel({ phase: "waking" }) : `${readingWhat()} · ${Math.round((keep.pct || 0) * 100)}%`);
+        const stop = new Promise(r => ctl.signal.addEventListener("abort", r, { once: true }));
+        while (keep.running && !ctl.signal.aborted) await Promise.race([keep.running, stop]);
+        keep.view = null;
+      }
       if (ctl.signal.aborted) throw { code: "cancelled" };
       const mat = await buildMaterial(text, intent, attachments, view);
       if (ctl.signal.aborted) throw { code: "cancelled" };
@@ -1670,9 +1911,10 @@ FORMAT
       const tail = (mat.notes.length ? `(Attached: ${mat.notes.join("; ")}.)\n\n` : "") + text;
       const tmap = topicMapBlock(text);
       const turns = fitTurns((tmap ? tmap + (mat.block ? "\n\n" : "") : "") + mat.block, tail);
-      state.turns.push({ role: "user", content: text + (mat.notes.length ? `\n(I attached ${mat.notes.join("; ")}.)` : "") });
+      state.turns.push({ role: "user", content: text + (mat.notes.length ? `\n(I attached ${mat.notes.join("; ")}.)` : ""), sent: turns[turns.length - 1].content });
       pushed = true;
       const opts = { signal: ctl.signal, cache: false, onText: u => view.stream(u.text) };
+      if (keeps()) opts.onProgress = p => view.status(progressLabel(p, textDocs().length ? "Reading your PDF" : "Reading"));
       const tier = state.style.deep ? "complex" : "default";
       if (tierOK(tier)) opts.modelTier = tier;
       if (mat.images.length) opts.images = mat.images.slice(0, Math.max(1, maxImages()));
@@ -1695,6 +1937,7 @@ FORMAT
       if (code === "tools_unavailable" && state.limits) state.limits = Object.assign({}, state.limits, { tools: undefined });
       if (PERMANENT.has(code)) setChatOff(code);
     } finally {
+      keep.contact = Date.now();
       if (epoch === state.epoch) { state.busy = false; state.ctl = null; setSendMode(false); updateSend(); }
     }
   }
@@ -1754,7 +1997,7 @@ FORMAT
         think.hidden = true;
         content.hidden = false;
         if (!statusEl.hidden && view.raw.length > view.statusAt + 40) statusEl.hidden = true;
-        renderInto(content, view.raw, view, final);
+        if (final || !updateLive(view)) renderInto(content, view.raw, view, final);
         if (stick) scrollToBottom();
       },
       settle() {
@@ -1793,8 +2036,11 @@ FORMAT
         body.insertBefore(box, foot);
       },
     };
-    view.t1 = setTimeout(() => { if (!view.raw && !view.done) label.textContent = "Still thinking"; }, 15000);
-    view.t2 = setTimeout(() => { if (!view.raw && !view.done) label.textContent = "Still thinking. Long PDFs and hard questions can take a minute."; }, 45000);
+    // A keeping model reports what it is doing instead (waking, reading, resuming).
+    if (!keeps()) {
+      view.t1 = setTimeout(() => { if (!view.raw && !view.done) label.textContent = "Still thinking"; }, 15000);
+      view.t2 = setTimeout(() => { if (!view.raw && !view.done) label.textContent = "Still thinking. Long PDFs and hard questions can take a minute."; }, 45000);
+    }
     return view;
   }
 
@@ -1830,7 +2076,55 @@ FORMAT
     linkCitations(box);
   }
 
+  // The finished items of a quiz or flashcard list that is still being written, for example
+  // {"title": "…", "questions": [{…}, {…}, {"q": "half a ques
+  function partialList(src, key) {
+    const out = { title: "", items: [] };
+    const t = /"title"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(src);
+    if (t) { try { out.title = JSON.parse('"' + t[1] + '"'); } catch (e) { /* title not finished */ } }
+    const m = new RegExp('"' + key + '"\\s*:\\s*\\[').exec(src);
+    if (!m) return out;
+    let depth = 0, inStr = false, escaped = false, from = -1;
+    for (let i = m.index + m[0].length; i < src.length; i++) {
+      const c = src[i];
+      if (inStr) {
+        if (escaped) escaped = false;
+        else if (c === "\\") escaped = true;
+        else if (c === '"') inStr = false;
+        continue;
+      }
+      if (c === '"') inStr = true;
+      else if (c === "{" || c === "[") { if (depth === 0 && c === "{") from = i; depth++; }
+      else if (c === "}" || c === "]") {
+        if (depth === 0) break;
+        depth--;
+        if (depth === 0 && c === "}" && from >= 0) {
+          try { out.items.push(JSON.parse(src.slice(from, i + 1))); } catch (e) { /* skip a broken item */ }
+          from = -1;
+        }
+      }
+    }
+    return out;
+  }
+
+  // While a quiz or flashcards are being written, only new items arrive: add them to the widget already
+  // on screen instead of redrawing the answer, so clicks on the first questions are never lost.
+  function updateLive(view) {
+    const fences = Array.from(view.raw.matchAll(/```(quiz|cards|flashcards)[^\n]*\n/gi));
+    const m = fences[fences.length - 1];
+    if (!m) return false;
+    const rest = view.raw.slice(m.index + m[0].length);
+    if (rest.includes("```")) return false;
+    const head = view.raw.slice(0, m.index);
+    if (view.liveHead !== head) { view.liveHead = head; view.liveW = null; return false; }
+    if (!view.liveW) return false;
+    const list = partialList(rest, /quiz/i.test(m[1]) ? "questions" : "cards");
+    view.liveW.setItems(list.items, "writing", list.title);
+    return true;
+  }
+
   function mountWidgets(box, view, final) {
+    let slot = 0;
     for (const code of Array.from(box.querySelectorAll("pre > code"))) {
       const lang = ((code.className || "").match(/language-([\w-]+)/) || [])[1] || "";
       if (!/^(quiz|cards|flashcards|json|videos|choices)$/i.test(lang)) continue;
@@ -1842,6 +2136,28 @@ FORMAT
         : data && Array.isArray(data.questions) ? "quiz" : data && Array.isArray(data.cards) ? "cards"
         : data && Array.isArray(data.videos) ? "videos" : Array.isArray(data) && data.every(x => typeof x === "string") ? "choices" : null;
       if (!kind) continue;
+      const at = slot++;
+      if (kind === "quiz" || kind === "cards") {
+        // why: a long quiz takes minutes to write on a slow model, so questions and cards appear one at
+        // a time as each is finished, and the student can start on the first straight away.
+        const key = kind === "quiz" ? "questions" : "cards";
+        const list = data ? { title: data.title, items: Array.isArray(data[key]) ? data[key] : [] } : partialList(src, key);
+        const phase = data ? "done" : final ? "cut" : "writing";
+        let w = view ? view.widgets.get("live:" + at) : null;
+        if (w && w.kind !== kind) w = null;
+        if (!w && list.items.length) {
+          w = kind === "quiz" ? buildQuiz(view) : buildCards();
+          if (view) view.widgets.set("live:" + at, w);
+        }
+        if (w) {
+          w.setItems(list.items, phase, list.title);
+          if (!w.count()) { pre.remove(); continue; }
+          if (view && phase === "writing") view.liveW = w;
+          pre.replaceWith(w);
+          continue;
+        }
+        if (data) { pre.remove(); continue; }
+      }
       if (!data) {
         const WAIT = { quiz: "Writing your quiz…", cards: "Writing your flashcards…", videos: "Picking videos…", choices: "…" };
         const FAIL = { quiz: "This quiz didn't come through properly. Ask for it again.", cards: "These flashcards didn't come through properly. Ask for them again.", videos: "The video list didn't come through properly. Ask for the videos again.", choices: "" };
@@ -1851,7 +2167,7 @@ FORMAT
       }
       let w = view && view.widgets.get(src);
       if (!w) {
-        w = kind === "quiz" ? buildQuiz(data, view) : kind === "cards" ? buildCards(data) : kind === "videos" ? buildVideos(data) : buildChoices(data);
+        w = kind === "videos" ? buildVideos(data) : buildChoices(data);
         if (!w) { pre.remove(); continue; }
         if (view) view.widgets.set(src, w);
       }
@@ -1969,25 +2285,28 @@ FORMAT
     return b;
   }
 
-  function buildQuiz(data, view) {
-    const qs = (Array.isArray(data.questions) ? data.questions : [])
-      .filter(q => q && typeof q.q === "string" && Array.isArray(q.options) && q.options.length >= 2).slice(0, 30);
-    if (!qs.length) return null;
+  // A quiz that takes its questions as they are written: setItems(items, "writing" | "done" | "cut", title).
+  function buildQuiz(view) {
     const root = el("div", "quiz");
+    root.kind = "quiz";
     const head = el("div", "widget-head");
-    head.append(el("span", "widget-title", data.title ? String(data.title) : "Quiz"));
+    const titleEl = el("span", "widget-title", "Quiz");
     const meta = el("span", "widget-meta");
-    head.append(meta);
-    root.append(head);
+    head.append(titleEl, meta);
     const list = el("ol", "q-list");
-    root.append(list);
+    const more = el("p", "widget-more");
     const foot = el("div", "widget-foot");
     foot.hidden = true;
-    let answered = 0, correct = 0;
-    const wrong = [];
-    const update = () => { meta.textContent = answered ? `${correct} of ${answered} right` : `${qs.length} question${qs.length > 1 ? "s" : ""}`; };
+    root.append(head, list, more, foot);
+    const qs = [], wrong = [];
+    let answered = 0, correct = 0, phase = "writing";
     const keys = "ABCDEFGH";
-    qs.forEach((q, i) => {
+    const update = () => {
+      meta.textContent = answered ? `${correct} of ${answered} right` : `${qs.length} question${qs.length === 1 ? "" : "s"}${phase === "writing" ? " so far" : ""}`;
+      more.hidden = phase !== "writing";
+      more.textContent = `Writing question ${qs.length + 1}…`;
+    };
+    function add(q, i) {
       const ans = clamp(parseInt(q.answer, 10) || 0, 0, q.options.length - 1);
       const li = el("li", "q");
       const stem = el("p", "q-stem");
@@ -2018,13 +2337,13 @@ FORMAT
           if (src) fb.append(src);
           fb.hidden = false;
           update();
-          if (answered === qs.length) showFoot();
+          if (answered === qs.length && phase !== "writing") showFoot();
         });
         opts.append(b);
       });
       li.append(stem, opts, fb);
       list.append(li);
-    });
+    }
     function showFoot() {
       foot.innerHTML = "";
       foot.append(el("p", "score", `You got ${correct} of ${qs.length}.`));
@@ -2032,24 +2351,37 @@ FORMAT
         const btns = el("div", "foot-btns");
         const intent = { whole: !!(view && view.whole) };
         if (wrong.length) btns.append(followBtn("Go over my mistakes", () => "I got these wrong in the quiz:\n" + wrong.map(w => `- Q${w.i + 1}: "${w.q.q}" I chose "${w.q.options[w.chosen]}"; the answer was "${w.q.options[w.ans]}".`).join("\n") + "\nExplain where my thinking went wrong, then give me one similar question for each to try again.", intent));
-        btns.append(followBtn("5 more, a bit harder", "Give me 5 more questions on the same material, a bit harder, without repeating these.", intent));
+        btns.append(followBtn("10 more questions", "Give me 10 more questions on the same material, without repeating these.", intent));
+        btns.append(followBtn("10 more, a bit harder", "Give me 10 more questions on the same material, a bit harder, without repeating these.", intent));
         foot.append(btns);
       }
       foot.hidden = false;
     }
-    root.append(foot);
-    update();
+    root.count = () => qs.length;
+    root.setItems = (items, next, title) => {
+      if (title) titleEl.textContent = String(title);
+      const valid = (Array.isArray(items) ? items : [])
+        .filter(q => q && typeof q.q === "string" && Array.isArray(q.options) && q.options.length >= 2).slice(0, 50);
+      for (let i = qs.length; i < valid.length; i++) { qs.push(valid[i]); add(valid[i], i); }
+      if (phase === "writing" && next !== "writing") {
+        phase = next;
+        if (phase === "cut" && qs.length) root.insertBefore(el("p", "widget-note", `Only ${qs.length} question${qs.length === 1 ? "" : "s"} came through before the answer stopped.`), foot);
+        if (qs.length && answered === qs.length) showFoot();
+      }
+      update();
+    };
     return root;
   }
 
-  function buildCards(data) {
-    let cards = (Array.isArray(data.cards) ? data.cards : []).filter(c => c && (c.front || c.back)).slice(0, 80);
-    if (!cards.length) return null;
+  // Flashcards that take their cards as they are written: setItems(items, "writing" | "done" | "cut", title).
+  function buildCards() {
+    let cards = [], taken = 0, phase = "writing";
     const root = el("div", "cards");
+    root.kind = "cards";
     const head = el("div", "widget-head");
-    head.append(el("span", "widget-title", data.title ? String(data.title) : "Flashcards"));
+    const titleEl = el("span", "widget-title", "Flashcards");
     const meta = el("span", "widget-meta");
-    head.append(meta);
+    head.append(titleEl, meta);
     const stage = el("div", "card-stage");
     const flip = el("button", "flip");
     flip.type = "button";
@@ -2070,8 +2402,15 @@ FORMAT
     root.append(head, stage, controls);
     let i = 0, flipped = false;
     const plain = s => String(s || "").replace(/\s+/g, " ").trim();
+    function status() {
+      meta.textContent = `Card ${i + 1} of ${cards.length}${phase === "writing" ? " so far" : ""}`;
+      prev.disabled = i === 0;
+      next.disabled = i === cards.length - 1;
+      mix.disabled = phase === "writing";
+    }
     function show() {
       const c = cards[i];
+      if (!c) return;
       front.innerHTML = `<span class="face-label">Question</span><span class="face-text">${inlineMd(c.front || "")}</span>`;
       back.innerHTML = `<span class="face-label">Answer</span><span class="face-text">${inlineMd(c.back || "")}</span>`;
       flipped = false;
@@ -2080,9 +2419,7 @@ FORMAT
       turn.textContent = "Show answer";
       srcRow.innerHTML = "";
       srcRow.hidden = true;
-      meta.textContent = `Card ${i + 1} of ${cards.length}`;
-      prev.disabled = i === 0;
-      next.disabled = i === cards.length - 1;
+      status();
     }
     function toggle() {
       flipped = !flipped;
@@ -2104,14 +2441,24 @@ FORMAT
       if (e.key === "ArrowRight" && i < cards.length - 1) { i++; show(); }
       else if (e.key === "ArrowLeft" && i > 0) { i--; show(); }
     });
-    show();
+    root.count = () => cards.length;
+    root.setItems = (items, nextPhase, title) => {
+      if (title) titleEl.textContent = String(title);
+      const valid = (Array.isArray(items) ? items : []).filter(c => c && (c.front || c.back)).slice(0, 80);
+      const first = !cards.length;
+      cards.push(...valid.slice(taken));
+      taken = Math.max(taken, valid.length);
+      if (phase === "writing") phase = nextPhase;
+      if (!cards.length) return;
+      if (first) show(); else status();
+    };
     return root;
   }
 
   const FOLLOWUPS = {
-    answer: [["Quiz me on this", "Quiz me on what you just explained: 5 questions."], ["Make flashcards", "Turn your last answer into flashcards."], ["Explain it more simply", "Explain that again more simply, with an analogy or a clinical example."], ["Go deeper", "Go deeper: the mechanism, the evidence, and what examiners push on."]],
-    quiz: [["Make flashcards", "Make flashcards on the same material."], ["Explain the topic", "Briefly explain the topic behind these questions."]],
-    cards: [["Quiz me instead", "Quiz me on the same material: 5 questions."], ["More cards", "Make more flashcards on the same material, without repeating these."]],
+    answer: [["Quiz me on this", "Quiz me on what you just explained: 10 questions."], ["Make flashcards", "Turn your last answer into flashcards."], ["Explain it more simply", "Explain that again more simply, with an analogy or a clinical example."], ["Go deeper", "Go deeper: the mechanism, the evidence, and what examiners push on."]],
+    quiz: [["10 more questions", "Give me 10 more questions on the same material, without repeating these."], ["Make flashcards", "Make flashcards on the same material."], ["Explain the topic", "Briefly explain the topic behind these questions."]],
+    cards: [["Quiz me instead", "Quiz me on the same material: 10 questions."], ["More cards", "Make more flashcards on the same material, without repeating these."]],
   };
   function buildFoot(view, withFollowups) {
     view.foot.innerHTML = "";
@@ -2210,6 +2557,7 @@ FORMAT
     if (state.ctl) { try { state.ctl.abort(); } catch (e) { /* already settled */ } }
     state.busy = false; state.ctl = null;
     state.turns = [];
+    state.histStart = 0;
     messagesEl.innerHTML = "";
     for (const p of state.pending) if (p.url) URL.revokeObjectURL(p.url);
     state.pending = [];

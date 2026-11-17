@@ -25,6 +25,15 @@ GGUF = "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
 MMPROJ = "mmproj-F16.gguf"
 CORES = 16
 PORT = 8080
+# why: one shared pool lets a student with a long PDF use most of it while a second student chats.
+CONTEXT = 65536
+SLOTS = 2
+# why: a 30-question quiz is about 6,000 tokens; this stops a runaway answer at about ten minutes.
+MAX_ANSWER = 8192
+# why: bigger prompt batches let the CPUs reuse each expert's weights across more tokens.
+BATCH = 2048
+# why: a page picture costs about one token per 32x32 pixels; this keeps one picture near 30 s on CPUs.
+IMAGE_TOKENS = 1024
 
 image = (
     modal.Image.from_registry("ubuntu:24.04", add_python="3.12")
@@ -45,17 +54,23 @@ app = modal.App("apex-model")
 
 
 # why: one container at most caps what a public page can spend, about $1 an hour, and it sleeps after 5 idle minutes.
-@app.cls(image=image, cpu=CORES, memory=32768, max_containers=1, scaledown_window=300, timeout=60 * 60)
+# Pre-emption stays allowed: turning it off triples the price, and the page resumes an answer that gets cut.
+@app.cls(image=image, cpu=CORES, memory=40960, max_containers=1, scaledown_window=300, timeout=60 * 60)
 @modal.concurrent(max_inputs=16)
 class Model:
     @modal.enter()
     def load(self) -> None:
         server = sorted(glob.glob("/opt/llama/**/llama-server", recursive=True))[0]
         env = dict(os.environ, LD_LIBRARY_PATH=os.path.dirname(server))
-        # why: the page sends no pictures, so the vision projector stays unloaded; two slots answer two students at once.
+        # why: checkpoints every 512 tokens let a follow-up reuse the instructions, the PDF and the
+        # conversation already read, instead of reading them again at about 100 tokens a second.
         self.proc = subprocess.Popen(
-            [server, "-m", "/models/model.gguf", "--host", "0.0.0.0", "--port", str(PORT),
-             "-t", str(CORES), "-c", "24576", "-np", "2", "-n", "1500", "--jinja", "--reasoning-budget", "0"],
+            [server, "-m", "/models/model.gguf", "--mmproj", "/models/mmproj.gguf",
+             "--host", "0.0.0.0", "--port", str(PORT), "-t", str(CORES),
+             "-c", str(CONTEXT), "-np", str(SLOTS), "--kv-unified", "-n", str(MAX_ANSWER),
+             "-b", str(BATCH), "-ub", str(BATCH),
+             "--ctx-checkpoints", "16", "--checkpoint-min-step", "512", "--cache-ram", "4096",
+             "--image-max-tokens", str(IMAGE_TOKENS), "--jinja", "--reasoning-budget", "0"],
             env=env,
         )
         # why: llama-server opens its port before the model is in memory, so wait here until it can answer.

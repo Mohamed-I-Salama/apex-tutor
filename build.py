@@ -1,9 +1,14 @@
-"""Build the shareable Apex Tutor website from the artifact page.
+"""Build the shareable Apex Tutor website from the chat page.
 
 Usage:
-    python build.py [the starter-kit zip, or apex-chat.html]
+    python build.py [apex-chat.html, or a starter-kit zip]
 
 Writes index.html next to this file. Commit and push this folder to update the live site.
+
+apex-chat.html here is the page's source. It started as the kit's prototype/apex-chat.html and adds
+longer quizzes, quizzes and flashcards that appear as they are written, and the parts for a slow
+model that keeps what it has read. Those parts switch on only when the model says it keeps what it
+reads (shim.js does), so the same file still works as the claude.ai artifact.
 
 why: the artifact asks Claude through the claude.ai viewer, which a plain website lacks,
 so shim.js stands in for it and answers through Apex's own model (model_server.py).
@@ -14,7 +19,7 @@ import sys
 import zipfile
 
 HERE = pathlib.Path(__file__).resolve().parent
-DEFAULT_SOURCE = HERE.parent / "apex-starter-kit-v8.zip"
+DEFAULT_SOURCE = HERE / "apex-chat.html"
 KIT_PAGE = "apex-starter-kit/prototype/apex-chat.html"
 
 TAGLINE = (
@@ -24,7 +29,7 @@ TAGLINE = (
 
 # why: on this site the answers come from Apex's own model, not Claude, so the page must not say Claude.
 REWORD = {
-    "Only the pages an answer needs are sent to Claude.": "Only the pages an answer needs are sent to Apex's model.",
+    "Only the pages an answer needs are sent to Claude.": "Their text is sent to Apex's own model, which answers from it.",
     "Pictures can't be sent to Claude from this view.": "Pictures can't be sent from this site.",
     "Answers use your Claude account.": "Answers come from Apex's own model.",
 }

@@ -1,16 +1,24 @@
 // why: the artifact asks Claude through the claude.ai viewer, which a plain website does not
 // have. This stands in for the viewer's `sample`, so the same page answers through Apex's own
 // model, Qwen3.6-35B-A3B, which model_server.py serves from Modal CPUs.
+//
+// Beyond the viewer's API it offers what a slow model that keeps what it has read needs:
+// limits().prefixCache, sample.warm() to read ahead, sample.keepAlive(), and opts.onProgress.
 (function () {
   if (window.claude) return;
 
-  var ENDPOINT = "https://msalama42003--apex-model-model-serve.us-east.modal.run/v1/chat/completions";
-  var SLOW_MS = 8000;
+  var BASE = "https://msalama42003--apex-model-model-serve.us-east.modal.run";
+  var ENDPOINT = BASE + "/v1/chat/completions";
   var RETRY_MS = 5000;
   var MAX_START_MS = 240000;
-  // why: Qwen's recommended settings for answering without a thinking phase, which would add a long silence on CPUs.
+  var RESUMES = 2;
+  // why: an awake server answers within a second; no answer by then means its machine is starting,
+  // which takes about a minute after 5 idle minutes.
+  var WAKE_MS = 3000;
+  // why: Qwen's recommended settings for answering without a thinking phase, which would add a long
+  // silence on CPUs. 8,000 tokens fits a 30-question quiz.
   var SETTINGS = {
-    max_tokens: 1500,
+    max_tokens: 8000,
     temperature: 0.7,
     top_p: 0.8,
     top_k: 20,
@@ -29,29 +37,7 @@
     return Boolean(signal && signal.aborted);
   }
 
-  function showNotice(text) {
-    var bar = document.createElement("div");
-    bar.setAttribute("role", "status");
-    bar.style.cssText = [
-      "position:fixed",
-      "top:calc(12px + env(safe-area-inset-top, 0px))",
-      "left:50%",
-      "transform:translateX(-50%)",
-      "z-index:2147483647",
-      "width:max-content",
-      "max-width:calc(100% - 32px)",
-      "padding:10px 14px",
-      "border-radius:10px",
-      "background:#1d2430",
-      "color:#fff",
-      "font:600 14px/1.4 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif",
-      "box-shadow:0 6px 20px rgba(0,0,0,.3)",
-      "text-align:center",
-    ].join(";");
-    bar.textContent = text;
-    document.body.appendChild(bar);
-    return bar;
-  }
+  function noop() {}
 
   function pause(ms, signal) {
     return new Promise(function (resolve, reject) {
@@ -71,23 +57,64 @@
     });
   }
 
-  async function once(messages, opts, onFirstText) {
+  // The page sends its instructions as the first turn; a chat model follows them best as the system message.
+  function toMessages(input) {
+    var turns = typeof input === "string" ? [{ role: "user", content: input }] : Array.prototype.slice.call(input);
+    return turns.map(function (turn, i) {
+      return { role: i === 0 && turns.length > 1 ? "system" : turn.role, content: String(turn.content) };
+    });
+  }
+
+  // why: the server reads JPEG and PNG, not WebP; and a phone photo is far bigger than the model uses.
+  function toJpeg(blob) {
+    return createImageBitmap(blob).then(function (bmp) {
+      var scale = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
+      var canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(bmp.width * scale));
+      canvas.height = Math.max(1, Math.round(bmp.height * scale));
+      var ctx = canvas.getContext("2d");
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+      if (bmp.close) bmp.close();
+      return canvas.toDataURL("image/jpeg", 0.85);
+    });
+  }
+
+  // One request. Streams text after `prefix`, reports progress, and says whether the answer finished,
+  // was cut off, or the model's machine isn't ready yet.
+  async function once(body, opts, report, prefix) {
+    var waking = setTimeout(function () {
+      report({ phase: "waking" });
+    }, WAKE_MS);
     var res;
     try {
       res = await fetch(ENDPOINT, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(Object.assign({ model: "apex", stream: true, messages: messages }, SETTINGS)),
+        body: JSON.stringify(body),
         signal: opts.signal,
       });
     } catch (err) {
-      if (stopped(opts.signal)) throw failure("cancelled", "Stopped");
+      clearTimeout(waking);
+      if (stopped(opts.signal)) throw failure("cancelled", "Stopped", prefix);
       return { retry: true };
     }
+    clearTimeout(waking);
     // why: these come from Modal while the model's machine is still starting after a quiet spell.
     if (res.status === 502 || res.status === 503 || res.status === 504) return { retry: true };
-    if (res.status === 429) throw failure("rate_limited", "Apex's model is busy.");
-    if (!res.ok || !res.body) throw failure("upstream_error", "Apex's model answered " + res.status + ".");
+    if (res.status === 429) throw failure("rate_limited", "Apex's model is busy.", prefix);
+    if (res.status === 400) {
+      var said = "";
+      try {
+        said = await res.text();
+      } catch (err) {
+        said = "";
+      }
+      if (/context|exceed|too long|n_ctx/i.test(said)) throw failure("prompt_too_large", "Too much text for one question.", prefix);
+      throw failure("invalid_request", "Apex's model couldn't read this request.", prefix);
+    }
+    if (!res.ok || !res.body) throw failure("upstream_error", "Apex's model answered " + res.status + ".", prefix);
     var reader = res.body.getReader();
     var decoder = new TextDecoder();
     var pending = "";
@@ -111,62 +138,94 @@
           } catch (err) {
             continue;
           }
+          if (event.prompt_progress) {
+            var p = event.prompt_progress;
+            report({ phase: "reading", total: p.total, cache: p.cache, processed: p.processed });
+          }
           var choice = event.choices && event.choices[0];
           if (!choice) continue;
           if (choice.finish_reason) reason = choice.finish_reason;
           var delta = choice.delta && choice.delta.content;
           if (typeof delta === "string" && delta) {
-            if (!text) onFirstText();
             text += delta;
-            if (opts.onText) opts.onText({ text: text, delta: delta });
+            if (opts.onText) opts.onText({ text: prefix + text, delta: delta });
           }
         }
       }
     } catch (err) {
-      throw stopped(opts.signal)
-        ? failure("cancelled", "Stopped", text)
-        : failure("upstream_error", "The connection dropped.", text);
+      if (stopped(opts.signal)) throw failure("cancelled", "Stopped", prefix + text);
+      return { cut: true, text: text };
     }
-    if (!text.trim()) throw failure("empty_completion", "No answer came back.");
-    return { text: text, truncated: reason === "length" };
+    // why: when Modal moves the machine mid-answer, the stream just ends, with no finish reason.
+    if (!reason) return { cut: true, text: text };
+    return { text: text, reason: reason };
+  }
+
+  // Keep asking until the model's machine is up; carry on from the cut when an answer is cut off.
+  async function run(messages, opts, extra) {
+    var report = opts.onProgress || noop;
+    var base = Object.assign({ model: "apex", stream: true, return_progress: true, messages: messages }, SETTINGS, extra);
+    var began = Date.now();
+    var done = "";
+    var resumes = 0;
+    for (;;) {
+      if (stopped(opts.signal)) throw failure("cancelled", "Stopped", done);
+      // why: the server continues a final assistant message instead of starting a new answer.
+      var body = done ? Object.assign({}, base, { messages: messages.concat([{ role: "assistant", content: done }]) }) : base;
+      var out = await once(body, opts, report, done);
+      if (out.retry) {
+        if (Date.now() - began > MAX_START_MS) throw failure("upstream_error", "Apex's model didn't start in time.", done);
+        await pause(RETRY_MS, opts.signal);
+        continue;
+      }
+      done += out.text;
+      if (out.cut) {
+        if (resumes >= RESUMES) throw failure("upstream_error", "The connection dropped.", done);
+        resumes += 1;
+        began = Date.now();
+        report({ phase: "resuming" });
+        continue;
+      }
+      return { text: done, reason: out.reason };
+    }
   }
 
   async function sample(input, opts) {
     opts = opts || {};
-    var turns =
-      typeof input === "string" ? [{ role: "user", content: input }] : Array.prototype.slice.call(input);
-    // why: the page sends its instructions as the first turn; a chat model follows them best as the system message.
-    var messages = turns.map(function (turn, i) {
-      return { role: i === 0 && turns.length > 1 ? "system" : turn.role, content: String(turn.content) };
-    });
-    var bar = null;
-    var slow = setTimeout(function () {
-      bar = showNotice("Apex runs on its own model, so a first answer can take up to a minute to start.");
-    }, SLOW_MS);
-    var settle = function () {
-      clearTimeout(slow);
-      if (bar) bar.remove();
-      bar = null;
-    };
-    var began = Date.now();
-    try {
-      for (;;) {
-        if (stopped(opts.signal)) throw failure("cancelled", "Stopped");
-        var out = await once(messages, opts, settle);
-        if (!out.retry) return out;
-        if (Date.now() - began > MAX_START_MS) {
-          throw failure("upstream_error", "Apex's model didn't start in time.");
-        }
-        await pause(RETRY_MS, opts.signal);
-      }
-    } finally {
-      settle();
+    var messages = toMessages(input);
+    if (opts.images && opts.images.length) {
+      var urls = await Promise.all(Array.prototype.map.call(opts.images, toJpeg));
+      var last = messages[messages.length - 1];
+      last.content = urls
+        .map(function (url) {
+          return { type: "image_url", image_url: { url: url } };
+        })
+        .concat([{ type: "text", text: last.content }]);
     }
+    var out = await run(messages, opts, {});
+    if (!out.text.trim()) throw failure("empty_completion", "No answer came back.");
+    return { text: out.text, truncated: out.reason === "length" };
   }
 
+  // Have the model read these turns now, so the question that follows only reads what is new.
+  sample.warm = async function (input, opts) {
+    opts = opts || {};
+    await run(toMessages(input), opts, { max_tokens: 1 });
+  };
+
+  // A light request that stops the model's machine going to sleep while someone is using the page.
+  sample.keepAlive = function () {
+    return fetch(BASE + "/health").then(noop, noop);
+  };
+
   sample.limits = function () {
-    // why: the model reads about 120 tokens a second on CPUs, so a smaller prompt keeps the wait for an answer short.
-    return Promise.resolve({ maxPromptBytes: 24000, modelTiers: ["default"] });
+    return Promise.resolve({
+      // why: about 27,000 tokens, which leaves room for a long quiz in the model's 64k context.
+      maxPromptBytes: 110000,
+      modelTiers: ["default"],
+      images: { maxCount: 2, maxInputBytes: 20 * 1024 * 1024 },
+      prefixCache: true,
+    });
   };
 
   window.claude = {
