@@ -237,6 +237,8 @@
       modelTiers: ["default"],
       images: { maxCount: 2, maxInputBytes: 20 * 1024 * 1024 },
       prefixCache: true,
+      // why: this site may download a text recogniser for scanned PDFs; the claude.ai viewer can't.
+      ocr: true,
     });
   };
 
@@ -757,6 +759,10 @@ button:disabled{cursor:default}
   // 500 characters a second on CPUs. This much is about 80 seconds of reading.
   const KEPT_DOC_LIMIT = 40000;
   const QUIZ_COUNTS = [10, 20, 30];
+  // why: a scanned PDF has no text to search, quiz or summarise. Where the page may download a text
+  // recogniser (a plain website, not the claude.ai viewer), it reads the pages on the student's device.
+  const TESS_SRC = "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js";
+  const OCR_MAX_PAGES = 100;
   const MAX_DOCS = 6;
 
   // ---------- curriculum map (built by tools/build_graph.py; injected at publish time) ----------
@@ -905,6 +911,7 @@ button:disabled{cursor:default}
   const canImages = () => !!(state.limits && state.limits.images);
   const maxImages = () => (state.limits && state.limits.images && state.limits.images.maxCount) || 0;
   const canTools = () => !!(state.limits && state.limits.tools);
+  const canOcr = () => !!(state.limits && state.limits.ocr);
   const tierOK = t => !(state.limits && Array.isArray(state.limits.modelTiers)) || state.limits.modelTiers.includes(t);
 
   // ---------- a model that keeps what it has read (Apex's own model) ----------
@@ -1201,11 +1208,84 @@ button:disabled{cursor:default}
       if (n === 1 || n % 4 === 0) renderAttachments();
     }
     structure(doc, raw);
+    if (doc.scanned && canOcr()) await recognizeScanned(doc, raw);
+    if (doc.removed) return;
     try { const bm = await bookmarks(pdf); if (bm) doc.outline = bm; } catch (e) { /* keep detected contents */ }
     doc.status = doc.scanned ? "scanned" : "ready";
     rebuildIndex();
     docsChanged();
     if (doc.scanned) toast(`${doc.name} looks scanned, so its text can't be read. Open a page and ask about it, and Apex will look at it as a picture.`);
+    else if (doc.ocrCut) toast(`Apex read the text of the first ${OCR_MAX_PAGES} pages of ${doc.name}. For later pages, add them as a separate PDF.`);
+  }
+
+  let tessPromise = null;
+  function loadTesseract() {
+    if (window.Tesseract) return Promise.resolve(window.Tesseract);
+    if (!tessPromise) {
+      tessPromise = new Promise((resolve, reject) => {
+        const s = document.createElement("script");
+        s.src = TESS_SRC;
+        s.onload = () => (window.Tesseract ? resolve(window.Tesseract) : reject(new Error("The text reader didn't start.")));
+        s.onerror = () => { tessPromise = null; reject(new Error("The text reader couldn't load.")); };
+        document.head.appendChild(s);
+      });
+    }
+    return tessPromise;
+  }
+  // Read the text on a scanned PDF's pages with text recognition, as lines with sizes like a text PDF's.
+  async function recognizeScanned(doc, raw) {
+    const blank = n => (raw[n - 1] || []).map(l => l.text).join("").replace(/\s+/g, "").length < 25;
+    const todo = [];
+    for (let n = 1; n <= doc.numPages; n++) if (blank(n)) todo.push(n);
+    if (!todo.length) return;
+    doc.ocrCut = todo.length > OCR_MAX_PAGES;
+    const pages = todo.slice(0, OCR_MAX_PAGES);
+    toast(`${doc.name} is scanned, so Apex is reading the text on its pages. This takes ${pages.length > 30 ? "a few minutes" : "a minute or two"}.`);
+    doc.ocrTotal = pages.length; doc.ocrDone = 0;
+    renderAttachments();
+    const workers = [];
+    try {
+      const T = await loadTesseract();
+      // why: two readers halve the wait on a computer; a phone with little memory gets one.
+      const two = (navigator.hardwareConcurrency || 2) >= 8 && (navigator.deviceMemory || 4) >= 4;
+      for (let i = 0; i < (two ? 2 : 1); i++) workers.push(await T.createWorker("eng", 1));
+      let next = 0;
+      await Promise.all(workers.map(async w => {
+        while (next < pages.length && !doc.removed) {
+          const n = pages[next++];
+          raw[n - 1] = await ocrPage(doc, n, w);
+          doc.ocrDone++;
+          renderAttachments();
+        }
+      }));
+      if (doc.removed) return;
+      structure(doc, raw);
+      doc.ocr = !doc.scanned;
+    } catch (e) {
+      doc.ocrCut = false; /* stays scanned: its pages can still be sent as pictures */
+    } finally {
+      doc.ocrTotal = 0;
+      for (const w of workers) w.terminate().catch(() => {});
+    }
+  }
+  async function ocrPage(doc, n, worker) {
+    const page = await doc.pdf.getPage(n);
+    const base = page.getViewport({ scale: 1 });
+    // why: about 170 dots per inch for an A4 page: as accurate as higher, and faster to read.
+    const scale = Math.min(3, 1400 / base.width);
+    const vp = page.getViewport({ scale });
+    const c = document.createElement("canvas");
+    c.width = Math.floor(vp.width); c.height = Math.floor(vp.height);
+    const ctx = c.getContext("2d");
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, c.width, c.height);
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    page.cleanup();
+    const { data } = await worker.recognize(c, {}, { text: true, blocks: true, hocr: false, tsv: false });
+    c.width = 0; c.height = 0;
+    return (data.lines || [])
+      .filter(l => l.text && l.text.trim() && l.confidence >= 40)
+      .map(l => ({ text: l.text.replace(/\s+/g, " ").trim(), size: Math.round(((l.bbox.y1 - l.bbox.y0) / scale) * 10) / 10 }));
   }
 
   function removeDoc(doc) {
@@ -1314,14 +1394,14 @@ button:disabled{cursor:default}
       name.addEventListener("click", () => openViewer(d, 1));
       const meta = el("span", "chip-meta");
       const modelReading = keep.running && d.status === "ready" && d.chars > 0;
-      meta.textContent = d.status === "loading" ? (d.numPages ? `Reading ${d.done} of ${d.numPages}` : "Opening")
+      meta.textContent = d.status === "loading" ? (d.ocrTotal ? `Reading scanned pages · ${d.ocrDone} of ${d.ocrTotal}` : d.numPages ? `Reading ${d.done} of ${d.numPages}` : "Opening")
         : d.status === "error" ? "Couldn't read" : d.status === "scanned" ? `${d.numPages} pages · scanned`
         : modelReading ? (keep.waking ? "Waking Apex" : `Apex is reading · ${Math.round((keep.pct || 0) * 100)}%`) : `${d.numPages} pages`;
       if (d.status === "error") chip.title = d.error || "";
       const x = el("button", "chip-x"); x.type = "button"; x.innerHTML = ICON.close; x.setAttribute("aria-label", `Remove ${d.name}`);
       x.addEventListener("click", () => removeDoc(d));
       chip.append(icon, name, meta, x);
-      if (d.status === "loading") { const bar = el("span", "chip-progress"); bar.style.setProperty("--p", d.numPages ? String(d.done / d.numPages) : "0.04"); chip.append(bar); }
+      if (d.status === "loading") { const bar = el("span", "chip-progress"); bar.style.setProperty("--p", d.ocrTotal ? String(Math.max(0.04, d.ocrDone / d.ocrTotal)) : d.numPages ? String(d.done / d.numPages) : "0.04"); chip.append(bar); }
       else if (modelReading) { const bar = el("span", "chip-progress"); bar.style.setProperty("--p", String(Math.max(0.04, keep.pct || 0))); chip.append(bar); }
       attachmentsEl.append(chip);
     }
@@ -1603,6 +1683,7 @@ FORMAT
     for (const d of docs) {
       let s = `${d.code}: "${d.name}", ${d.numPages} pages.`;
       if (d.status === "scanned") s += " Scanned, with no text layer: you can only read pages that are sent to you as pictures.";
+      if (d.ocr) s += " Scanned; its text was read with text recognition, so expect some misread words, and check a page as a picture when it matters.";
       const outline = d.outline.slice(0, 120).map(o => `  p. ${o.page}  ${"  ".repeat(Math.max(0, (o.level || 1) - 1))}${o.title}`).join("\n");
       if (outline) s += "\nContents (detected):\n" + outline;
       const figs = d.figures.slice(0, 40).map(f => `  ${f.label} (p. ${f.page})${f.caption ? ": " + f.caption : ""}`).join("\n");

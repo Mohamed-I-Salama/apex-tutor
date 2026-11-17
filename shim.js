@@ -225,6 +225,8 @@
       modelTiers: ["default"],
       images: { maxCount: 2, maxInputBytes: 20 * 1024 * 1024 },
       prefixCache: true,
+      // why: this site may download a text recogniser for scanned PDFs; the claude.ai viewer can't.
+      ocr: true,
     });
   };
 
