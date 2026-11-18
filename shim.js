@@ -15,17 +15,9 @@
   // why: an awake server answers within a second; no answer by then means its machine is starting,
   // which takes about a minute after 5 idle minutes.
   var WAKE_MS = 3000;
-  // why: Qwen's recommended settings for answering without a thinking phase, which would add a long
-  // silence on CPUs. 8,000 tokens fits a 30-question quiz.
-  var SETTINGS = {
-    max_tokens: 8000,
-    temperature: 0.7,
-    top_p: 0.8,
-    top_k: 20,
-    min_p: 0,
-    presence_penalty: 1.5,
-    chat_template_kwargs: { enable_thinking: false },
-  };
+  // why: 8,000 tokens fits a 30-question quiz. The model's own settings (sampling, thinking off) are
+  // set on the server in model_server.py, so a model change doesn't need a website change.
+  var SETTINGS = { max_tokens: 8000 };
 
   function failure(code, message, text) {
     var error = { code: code, message: message || code };
