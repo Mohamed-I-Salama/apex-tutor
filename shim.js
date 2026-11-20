@@ -7,7 +7,10 @@
 (function () {
   if (window.claude) return;
 
-  var BASE = "https://msalama42003--apex-model-model-serve.us-east.modal.run";
+  // why: the gateway picks a model for each answer (the owner's laptop, Cloudflare's GPUs, Modal) and
+  // holds their keys; until it exists, the page calls Modal directly.
+  var SITE = window.APEX_SITE || {};
+  var BASE = SITE.gateway || "https://msalama42003--apex-model-model-serve.us-east.modal.run";
   var ENDPOINT = BASE + "/v1/chat/completions";
   var RETRY_MS = 5000;
   var MAX_START_MS = 240000;

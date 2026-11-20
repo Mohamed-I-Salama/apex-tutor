@@ -319,6 +319,14 @@ button:disabled{cursor:default}
 .switch input:checked{background:var(--accent)}
 .switch input:checked::after{transform:translateX(16px)}
 .panel textarea{display:block;width:100%;min-height:86px;resize:vertical;border-radius:12px;border:1px solid var(--line-strong);background:var(--bg);padding:10px 12px;font-size:.92rem;line-height:1.45}
+.field-input{display:block;width:100%;height:38px;margin:0 0 12px;border-radius:12px;border:1px solid var(--line-strong);background:var(--bg);color:var(--ink);padding:0 10px;font-size:.92rem}
+.field-input[hidden]{display:none}
+#studiesPanel textarea{margin-bottom:12px}
+.account-row{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;min-height:40px;margin:0 0 14px;padding:8px 10px;border-radius:12px;background:var(--surface-2);font-size:.88rem;color:var(--ink-2)}
+.account-row:empty{display:none}
+#stForget{margin-right:auto}
+@media (max-width:440px){#studiesBtn span{display:none}}
+.panel-foot{gap:8px;align-items:center}
 .panel-hint{margin:6px 0 0;font-size:.8rem;color:var(--ink-3)}
 .panel-foot{display:flex;justify-content:flex-end;margin-top:14px}
 
@@ -405,6 +413,10 @@ button:disabled{cursor:default}
               <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h4M12 17h8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="16" cy="7" r="2.2" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="10" cy="17" r="2.2" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>
               <span>Style</span>
             </button>
+            <button type="button" class="tool-btn" id="studiesBtn" aria-label="My studies" aria-haspopup="dialog" aria-expanded="false" aria-controls="studiesPanel" hidden>
+              <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M3 9.5L12 5l9 4.5-9 4.5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M7 11.5v4.2c1.4 1.3 3.1 2 5 2s3.6-.7 5-2v-4.2M21 9.5v5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              <span>My studies</span>
+            </button>
             <span class="bar-spacer"></span>
             <button type="submit" class="send-btn" id="sendBtn" aria-label="Send" disabled></button>
           </div>
@@ -464,6 +476,24 @@ button:disabled{cursor:default}
   <textarea id="optAbout" rows="3" placeholder="For example: I'm revising for my fixed pros exam next month. Use bullet points. If I write in Arabic, answer in Arabic."></textarea>
   <p class="panel-hint">Saved on this device. You can also just tell Apex in the chat.</p>
   <div class="panel-foot"><button type="button" class="btn-primary small" id="styleDone">Done</button></div>
+</div>
+
+<div class="panel" id="studiesPanel" role="dialog" aria-labelledby="studiesTitle" hidden>
+  <h2 id="studiesTitle">My studies</h2>
+  <div class="account-row" id="accountRow"></div>
+  <label class="field-label" for="stUni">University</label>
+  <select id="stUni" class="field-input"></select>
+  <input type="text" id="stUniOther" class="field-input" placeholder="Your university" hidden>
+  <label class="field-label" for="stProg">Programme</label>
+  <select id="stProg" class="field-input"></select>
+  <input type="text" id="stProgOther" class="field-input" placeholder="For example: BDS, or Master's in Orthodontics" hidden>
+  <label class="field-label" for="stTerm">Where you are now</label>
+  <select id="stTerm" class="field-input"></select>
+  <label class="field-label" for="stCourses">Courses this term <span class="optional">One per line</span></label>
+  <textarea id="stCourses" rows="4" placeholder="For example: Endodontics III"></textarea>
+  <label class="switch" for="stShare"><span>Help map my university's curriculum<small>Shares your university, programme, term and course list with Apex. Never your PDFs or chats. Needs sign-in.</small></span><input type="checkbox" id="stShare"></label>
+  <p class="panel-hint" id="stHint">Saved on this device.</p>
+  <div class="panel-foot"><button type="button" class="mini-btn" id="stForget" hidden>Delete my account</button><button type="button" class="btn-primary small" id="studiesDone">Done</button></div>
 </div>
 
 <div class="viewer" id="viewer" hidden>
@@ -960,6 +990,7 @@ button:disabled{cursor:default}
     doc.status = doc.scanned ? "scanned" : "ready";
     rebuildIndex();
     docsChanged();
+    keepPdf(doc, file);
     if (doc.scanned) toast(`${doc.name} looks scanned, so its text can't be read. Open a page and ask about it, and Apex will look at it as a picture.`);
     else if (doc.ocrCut) toast(`Apex read the text of the first ${OCR_MAX_PAGES} pages of ${doc.name}. For later pages, add them as a separate PDF.`);
   }
@@ -1041,6 +1072,7 @@ button:disabled{cursor:default}
     state.pending = state.pending.filter(p => p.doc !== doc);
     rebuildIndex(); renderAttachments(); updatePdfActions(); updateSend();
     docsChanged();
+    if (doc.key) dropPdf(doc.key);
   }
 
   // ---------- search over the PDFs (BM25) ----------
@@ -1441,7 +1473,7 @@ FORMAT
     }
     return out.join("\n\n");
   }
-  const buildInstructions = () => rules() + "\n\n" + prefsBlock() + "\n\n" + libraryBlock() + (keeps() ? keptDocs().text : "");
+  const buildInstructions = () => rules() + "\n\n" + prefsBlock() + studiesBlock() + "\n\n" + libraryBlock() + (keeps() ? keptDocs().text : "");
 
   const WHOLE_RE = /\b(summar\w*|overview|key points?|high[- ]yield|main points|cheat ?sheet|revision notes|quiz|mcqs?|questions|flash ?cards?|test me|everything|whole|entire)\b/i;
   const DOC_RE = /\b(pdfs?|papers?|documents?|docs?|files?|lectures?|notes|slides|articles?|chapters?|this|it|them|uploads?)\b/i;
@@ -2452,7 +2484,8 @@ ${FENCE}` : ""}`);
     const pick = (tag, n) => shuffle(IDEAS.filter(x => x[0] === tag)).slice(0, n);
     const hasBusiness = TOPICS.some(t => t.field === "business");
     const set = hasBusiness ? pick("Prosthodontics", 1).concat(pick("Endodontics", 1), pick("MBA", 2)) : pick("Prosthodontics", 2).concat(pick("Endodontics", 2));
-    for (const [tag, text] of shuffle(set)) {
+    const mine = studySuggestion();
+    for (const [tag, text] of mine ? [mine].concat(shuffle(set).slice(0, 3)) : shuffle(set)) {
       const b = el("button", "sugg");
       b.type = "button";
       b.append(el("span", "sugg-tag", tag), el("span", "sugg-text", text));
@@ -2543,6 +2576,340 @@ ${FENCE}` : ""}`);
     if (!stylePanel.hidden && !stylePanel.contains(e.target) && !styleBtn.contains(e.target)) closeStyle(false);
   });
   window.addEventListener("resize", () => { if (!stylePanel.hidden) positionPanel(); });
+
+  // ---------- my studies, sign-in, and PDFs kept on this device ----------
+  // why: Apex teaches better when it knows the student's programme, term and courses. With the
+  // student's consent the same details help map each university's curriculum (kit ADR 0002). This
+  // runs only on the website, which provides the programme list; the claude.ai artifact doesn't.
+  const SITE = window.APEX_SITE || null;
+  const PROGRAMS = (window.APEX_PROGRAMS && window.APEX_PROGRAMS.programs) || [];
+  const UNMAPPED = (window.APEX_PROGRAMS && window.APEX_PROGRAMS.unmapped) || [];
+  const STUDIES_KEY = "apex.studies.v1", ACCOUNT_KEY = "apex.account.v1";
+  const readKey = k => { try { return JSON.parse(localStorage.getItem(k) || "null"); } catch (e) { return null; } };
+  const writeKey = (k, v) => { try { if (v == null) localStorage.removeItem(k); else localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* storage blocked */ } };
+  state.studies = readKey(STUDIES_KEY) || {};
+  state.account = readKey(ACCOUNT_KEY);
+  const studiesPanel = $("#studiesPanel"), studiesBtn = $("#studiesBtn");
+  const OTHER = "__other";
+  const GENERIC_TERMS = ["Undergraduate, year 1", "Undergraduate, year 2", "Undergraduate, year 3", "Undergraduate, year 4",
+    "Undergraduate, year 5", "Internship year", "Master's, semester 1", "Master's, semester 2", "Master's, semester 3",
+    "Master's, semester 4", "Master's, semester 5", "Master's, semester 6", "Doctorate", "Other"];
+  const programOf = s => PROGRAMS.find(x => x.id === s.programId) || null;
+  function termLabel(t, prog) {
+    if (t === "Prep") return "Preparatory term";
+    const m = /^S(\d+)$/.exec(t || "");
+    if (!m) return t || "";
+    let label = "Semester " + m[1];
+    if (prog && prog.parts) for (const [part, terms] of Object.entries(prog.parts)) if (terms.includes(t)) label = part + ", semester " + m[1];
+    return label;
+  }
+
+  function studiesBlock() {
+    const s = state.studies;
+    if (!SITE || !s || !(s.university || s.programId || s.programOther)) return "";
+    const prog = programOf(s);
+    const lines = ["THIS STUDENT'S STUDIES (from their profile. Connect answers to these courses and this exam format when it helps; don't assume anything that isn't here.)"];
+    if (s.university) lines.push(`- University: ${s.university}${prog && prog.faculty ? ", " + prog.faculty : ""}`);
+    const name = prog ? prog.degree : s.programOther;
+    if (name) lines.push(`- Programme: ${name}`);
+    if (s.term) lines.push(`- Now: ${prog ? termLabel(s.term, prog) : s.term}`);
+    const courses = (s.courses || []).filter(Boolean);
+    if (courses.length) lines.push(`- Courses this term: ${courses.join("; ")}`);
+    const w = prog && prog.weights;
+    if (w) lines.push(`- Exam weights: written ${w.written}%, practical ${w.practical}%, oral ${w.oral}%${w.coursework ? `, coursework ${w.coursework}%` : ""}`);
+    return "\n\n" + lines.join("\n");
+  }
+  // A starter that uses the student's own courses, once they've told Apex what they are.
+  function studySuggestion() {
+    const s = state.studies;
+    return SITE && s && (s.courses || []).length ? ["My term", "Make me a revision plan for my courses this term, with self-testing built in"] : null;
+  }
+
+  function fillSelect(sel, items, value) {
+    sel.innerHTML = "";
+    const groups = new Map();
+    for (const it of items) {
+      const opt = el("option", null, it.label);
+      opt.value = it.value;
+      if (!it.group) { sel.append(opt); continue; }
+      if (!groups.has(it.group)) { const g = document.createElement("optgroup"); g.label = it.group; groups.set(it.group, g); sel.append(g); }
+      groups.get(it.group).append(opt);
+    }
+    sel.value = items.some(i => i.value === value) ? value : items[0].value;
+  }
+  function universities() {
+    const mapped = [...new Set(PROGRAMS.map(p => p.institution))].sort();
+    const more = [...new Set(UNMAPPED.map(u => u.institution))].filter(n => !mapped.includes(n)).sort();
+    return [{ value: "", label: "Choose your university" }]
+      .concat(mapped.map(n => ({ value: n, label: n, group: "Programmes Apex has mapped" })))
+      .concat(more.map(n => ({ value: n, label: n, group: "Not mapped yet" })))
+      .concat([{ value: OTHER, label: "Another university" }]);
+  }
+  const currentUni = () => $("#stUni").value === OTHER ? $("#stUniOther").value.trim() : $("#stUni").value;
+  function renderStudies() {
+    const s = state.studies;
+    const known = universities().some(u => u.value === s.university && s.university);
+    fillSelect($("#stUni"), universities(), known ? s.university : s.university ? OTHER : "");
+    $("#stUniOther").hidden = $("#stUni").value !== OTHER;
+    $("#stUniOther").value = known ? "" : s.university || "";
+    renderPrograms();
+    $("#stCourses").value = (s.courses || []).join("\n");
+    $("#stShare").checked = !!s.share;
+    renderAccount();
+  }
+  function renderPrograms() {
+    const s = state.studies, uni = currentUni();
+    const progs = PROGRAMS.filter(p => p.institution === uni);
+    const items = [{ value: "", label: progs.length ? "Choose your programme" : "Type your programme below" }]
+      .concat(progs.map(p => ({ value: p.id, label: p.degree })))
+      .concat([{ value: OTHER, label: "Another programme" }]);
+    const pick = progs.some(p => p.id === s.programId) ? s.programId : s.programOther || !progs.length ? OTHER : "";
+    fillSelect($("#stProg"), items, pick);
+    $("#stProgOther").hidden = $("#stProg").value !== OTHER;
+    $("#stProgOther").value = s.programOther || "";
+    renderTerms();
+  }
+  function renderTerms() {
+    const prog = PROGRAMS.find(p => p.id === $("#stProg").value);
+    const items = prog ? prog.terms.map(t => ({ value: t, label: termLabel(t, prog) })) : GENERIC_TERMS.map(t => ({ value: t, label: t }));
+    fillSelect($("#stTerm"), [{ value: "", label: "Choose" }].concat(items), state.studies.term);
+  }
+  // Fill this term's courses from the programme, unless the student has typed their own.
+  function suggestCourses() {
+    const prog = PROGRAMS.find(p => p.id === $("#stProg").value), term = $("#stTerm").value;
+    const box = $("#stCourses");
+    if (box.value.trim() && box.dataset.auto !== box.value) return;
+    box.value = prog ? prog.courses.filter(c => c.term === term).map(c => c.title).join("\n") : "";
+    box.dataset.auto = box.value;
+  }
+  function readStudies() {
+    const sel = $("#stProg").value, prog = PROGRAMS.find(p => p.id === sel);
+    state.studies = {
+      university: currentUni(),
+      programId: prog ? prog.id : "",
+      programOther: prog ? "" : $("#stProgOther").value.trim(),
+      term: $("#stTerm").value,
+      courses: $("#stCourses").value.split("\n").map(x => x.trim()).filter(Boolean).slice(0, 40),
+      share: $("#stShare").checked,
+    };
+    writeKey(STUDIES_KEY, state.studies);
+    markStudies();
+    syncSoon();
+  }
+  const markStudies = () => studiesBtn.classList.toggle("is-set", !!(state.studies.university || state.studies.programId || state.studies.programOther));
+
+  // ---------- sign-in (Google) and the student's account ----------
+  const signInReady = () => !!(SITE && SITE.gateway && SITE.googleClientId);
+  async function api(path, init) {
+    const headers = { "Content-Type": "application/json" };
+    if (state.account) headers.Authorization = "Bearer " + state.account.token;
+    const res = await fetch(SITE.gateway + path, Object.assign({ headers }, init));
+    if (res.status === 401 && state.account) { state.account = null; writeKey(ACCOUNT_KEY, null); renderAccount(); }
+    if (!res.ok) throw new Error("gateway " + res.status);
+    return res.json();
+  }
+  let googlePromise = null;
+  function loadGoogle() {
+    if (window.google && window.google.accounts) return Promise.resolve(window.google);
+    if (!googlePromise) {
+      googlePromise = new Promise((resolve, reject) => {
+        const sc = document.createElement("script");
+        sc.src = "https://accounts.google.com/gsi/client";
+        sc.onload = () => (window.google && window.google.accounts ? resolve(window.google) : reject(new Error("no Google")));
+        sc.onerror = () => { googlePromise = null; reject(new Error("Google sign-in couldn't load")); };
+        document.head.appendChild(sc);
+      });
+    }
+    return googlePromise;
+  }
+  function renderAccount() {
+    const row = $("#accountRow");
+    row.innerHTML = "";
+    $("#stForget").hidden = !state.account;
+    if (!signInReady()) { $("#stHint").textContent = "Saved on this device."; return; }
+    if (state.account) {
+      const u = state.account.user || {};
+      row.append(el("span", null, `Signed in as ${u.name || u.email || "you"}`));
+      const out = el("button", "mini-btn", "Sign out");
+      out.type = "button";
+      out.addEventListener("click", signOut);
+      row.append(out);
+      $("#stHint").textContent = "Saved to your account and on this device.";
+      return;
+    }
+    row.append(el("span", null, "Sign in to keep your studies on every device."));
+    const slot = el("div");
+    row.append(slot);
+    loadGoogle().then(g => {
+      g.accounts.id.initialize({ client_id: SITE.googleClientId, callback: onGoogle });
+      g.accounts.id.renderButton(slot, { theme: "outline", size: "medium", text: "signin_with", shape: "pill" });
+    }).catch(() => slot.replaceWith(el("span", null, "Google sign-in couldn't load here.")));
+    $("#stHint").textContent = "Saved on this device.";
+  }
+  const fromServer = p => ({
+    university: p.university || "", programId: p.program_id || "", programOther: p.program_id ? "" : p.program_name || "",
+    term: p.semester || "", courses: Array.isArray(p.courses) ? p.courses : [], share: !!p.share_curriculum,
+  });
+  async function onGoogle(resp) {
+    try {
+      const out = await api("/auth/google", { method: "POST", body: JSON.stringify({ credential: resp.credential }) });
+      state.account = { token: out.token, user: out.user };
+      writeKey(ACCOUNT_KEY, state.account);
+      // A profile already saved to the account wins; otherwise what's on this device is saved to it.
+      if (out.profile) { state.studies = fromServer(out.profile); writeKey(STUDIES_KEY, state.studies); markStudies(); }
+      else syncSoon(0);
+      if (!studiesPanel.hidden) renderStudies(); else renderAccount();
+      toast("Signed in.");
+    } catch (e) {
+      toast("Sign-in didn't work. Try again.");
+    }
+  }
+  function signOut() {
+    state.account = null;
+    writeKey(ACCOUNT_KEY, null);
+    try { if (window.google) window.google.accounts.id.disableAutoSelect(); } catch (e) { /* not loaded */ }
+    renderAccount();
+  }
+  let syncTimer = 0;
+  function syncSoon(ms) {
+    clearTimeout(syncTimer);
+    if (!state.account || !signInReady()) return;
+    syncTimer = setTimeout(() => {
+      const s = state.studies, prog = programOf(s);
+      api("/me/profile", {
+        method: "PUT",
+        body: JSON.stringify({
+          university: s.university || null, faculty: prog ? prog.faculty : null, program_id: s.programId || null,
+          program_name: prog ? prog.degree : s.programOther || null, degree: prog ? prog.specialty : null,
+          semester: s.term || null, courses: s.courses || [], share_curriculum: !!s.share,
+        }),
+      }).catch(() => toast("Couldn't save your studies to your account. They're saved on this device."));
+    }, ms == null ? 1200 : ms);
+  }
+  let forgetArmed = 0;
+  async function forgetMe() {
+    const b = $("#stForget");
+    if (Date.now() - forgetArmed > 5000) { forgetArmed = Date.now(); b.textContent = "Tap again to delete everything"; return; }
+    try {
+      await api("/me", { method: "DELETE" });
+      state.studies = {};
+      writeKey(STUDIES_KEY, null);
+      signOut();
+      renderStudies();
+      markStudies();
+      toast("Your account and everything Apex held about you are deleted.");
+    } catch (e) {
+      toast("Couldn't delete your account just now. Try again.");
+    }
+    b.textContent = "Delete my account";
+  }
+
+  function placeStudies() {
+    const r = studiesBtn.getBoundingClientRect();
+    const pw = studiesPanel.offsetWidth, ph = studiesPanel.offsetHeight;
+    const left = clamp(r.left, 16, Math.max(16, window.innerWidth - pw - 16));
+    let top = r.top - ph - 10;
+    if (top < 16) top = Math.min(r.bottom + 10, window.innerHeight - ph - 16);
+    studiesPanel.style.left = left + "px";
+    studiesPanel.style.top = Math.max(16, top) + "px";
+  }
+  function openStudies() {
+    closeStyle(false);
+    renderStudies();
+    studiesPanel.hidden = false;
+    studiesBtn.setAttribute("aria-expanded", "true");
+    placeStudies();
+    $("#stUni").focus();
+  }
+  function closeStudies(returnFocus) {
+    if (studiesPanel.hidden) return;
+    studiesPanel.hidden = true;
+    studiesBtn.setAttribute("aria-expanded", "false");
+    if (returnFocus) studiesBtn.focus();
+    if (app.classList.contains("is-empty")) renderSuggestions();
+  }
+
+  // ---------- the student's PDFs, kept on this device ----------
+  // why: a student's library should still be there next time, without sending their PDFs anywhere.
+  const idbOpen = () => new Promise((resolve, reject) => {
+    const req = indexedDB.open("apex", 1);
+    req.onupgradeneeded = () => req.result.createObjectStore("pdfs", { keyPath: "key" });
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  async function idbDo(mode, fn) {
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction("pdfs", mode);
+      const req = fn(tx.objectStore("pdfs"));
+      tx.oncomplete = () => resolve(req ? req.result : undefined);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+    });
+  }
+  async function keepPdf(doc, file) {
+    if (!SITE || doc.removed || !window.indexedDB) return;
+    doc.key = doc.key || `${file.name}|${file.size}|${file.lastModified || 0}`;
+    const rec = { key: doc.key, name: doc.name, added: Date.now(), blob: file, numPages: doc.numPages, pages: doc.pages, outline: doc.outline,
+      figures: doc.figures, tables: doc.tables, chars: doc.chars, scanned: doc.scanned, ocr: !!doc.ocr };
+    try { await idbDo("readwrite", st => st.put(rec)); } catch (e) { /* storage full or blocked: the PDF still works this visit */ }
+  }
+  async function dropPdf(key) {
+    try { await idbDo("readwrite", st => st.delete(key)); } catch (e) { /* nothing kept */ }
+  }
+  async function restorePdfs() {
+    if (!SITE || !window.indexedDB) return;
+    let recs = [];
+    try { recs = (await idbDo("readonly", st => st.getAll())) || []; } catch (e) { return; }
+    recs.sort((a, b) => a.added - b.added);
+    for (const r of recs.slice(0, MAX_DOCS)) {
+      const doc = { id: ++state.docSeq, code: "D" + state.docSeq, name: r.name, status: r.scanned ? "scanned" : "ready", done: r.numPages,
+        numPages: r.numPages, pages: r.pages || [], outline: r.outline || [], figures: r.figures || [], tables: r.tables || [], chars: r.chars || 0,
+        scanned: !!r.scanned, ocr: !!r.ocr, pdf: null, removed: false, key: r.key };
+      state.docs.push(doc);
+      // The page viewer and page pictures need the PDF itself, so it is opened quietly.
+      loadPdfJs()
+        .then(lib => r.blob.arrayBuffer().then(buf => lib.getDocument({ data: new Uint8Array(buf), isEvalSupported: false }).promise))
+        .then(pdf => { if (doc.removed) pdf.destroy(); else doc.pdf = pdf; })
+        .catch(() => { /* text still works without the viewer */ });
+    }
+    if (recs.length) { rebuildIndex(); renderAttachments(); updatePdfActions(); updateSend(); docsChanged(); }
+  }
+
+  if (SITE && PROGRAMS.length) {
+    studiesBtn.hidden = false;
+    markStudies();
+    studiesBtn.addEventListener("click", () => { if (studiesPanel.hidden) openStudies(); else closeStudies(true); });
+    $("#studiesDone").addEventListener("click", () => closeStudies(true));
+    $("#stForget").addEventListener("click", forgetMe);
+    $("#stUni").addEventListener("change", () => {
+      $("#stUniOther").hidden = $("#stUni").value !== OTHER;
+      state.studies.programId = ""; state.studies.programOther = ""; state.studies.term = "";
+      renderPrograms(); suggestCourses(); readStudies();
+    });
+    $("#stUniOther").addEventListener("input", () => { renderPrograms(); readStudies(); });
+    $("#stProg").addEventListener("change", () => {
+      $("#stProgOther").hidden = $("#stProg").value !== OTHER;
+      state.studies.term = "";
+      renderTerms(); suggestCourses(); readStudies();
+    });
+    $("#stProgOther").addEventListener("input", readStudies);
+    $("#stTerm").addEventListener("change", () => { suggestCourses(); readStudies(); });
+    $("#stCourses").addEventListener("input", readStudies);
+    $("#stShare").addEventListener("change", () => {
+      if ($("#stShare").checked && !state.account) {
+        $("#stShare").checked = false;
+        $("#stHint").textContent = signInReady() ? "Sign in first to share your curriculum details." : "Sharing opens once sign-in is switched on.";
+        return;
+      }
+      readStudies();
+    });
+    document.addEventListener("pointerdown", e => {
+      if (!studiesPanel.hidden && !studiesPanel.contains(e.target) && !studiesBtn.contains(e.target)) closeStudies(false);
+    });
+    window.addEventListener("resize", () => { if (!studiesPanel.hidden) placeStudies(); });
+    restorePdfs();
+  }
 
   // ---------- events ----------
   composer.addEventListener("submit", e => {
